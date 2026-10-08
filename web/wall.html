@@ -1243,7 +1243,7 @@ if(sortBy==='arrived' && localStorage.nzbfastWallSortChosen!=='1'){
 // new sort should never inherit a reversal you set for the last one.
 let dirFlip = localStorage.nzbfastWallDirFlip === 'on';
 // M28: the grid is server-paged (mode=wall2) - these track the window.
-let wtotal = 0, wseq = 0, wloading = false, wsig = '';
+let wtotal = 0, wseq = 0, wloading = false, wsig = '', wskew = 0;
 // U4: what the empty wall should say. `idxGroups` is the server's count
 // of newsgroups chosen for indexing (-1 until the first wall2 answer);
 // `unmTotal` is how many entries a probe found hiding behind "Matched
@@ -4303,7 +4303,13 @@ async function wallFetch(reset){
   showSkeleton(seq);
   try{
     const q=document.getElementById('q').value.trim();
-    const offset=reset?0:cards.length;
+    // GH #325: paging is by offset, and the wall deliberately does NOT
+    // reset when arrivals land while the reader is scrolled down. Those
+    // arrivals push the server's list down, so the next page re-sends
+    // cards already on the wall. `wskew` counts the duplicates dropped
+    // since the last reset, so the next offset steps past them and the
+    // scroll continues exactly where it left off.
+    const offset=reset?0:cards.length+wskew;
     // Matched only OFF = show everything, junk included (all=1).
     const qs=
       `&cat=${encodeURIComponent(tab||'all')}&q=${encodeURIComponent(q)}`+
@@ -4382,7 +4388,7 @@ async function wallFetch(reset){
           wtotal ? tn('wall.count',wtotal,'{n} title','{n} titles') : '';
         return;
       }
-      wsig=sig; cards=page;
+      wsig=sig; cards=page; wskew=0;
       render();
       renderStrips();
     } else {
@@ -4392,8 +4398,11 @@ async function wallFetch(reset){
       // hover/focus state mid-scroll.
       // push, not concat: concat copies the whole array on every
       // page, which is O(n^2) copy churn over a long scroll.
-      cards.push(...page);
-      appendCards(page);
+      const have=new Set(cards.map(c=>c.key));
+      const fresh=page.filter(c=>!have.has(c.key)&&have.add(c.key));
+      wskew+=page.length-fresh.length;
+      cards.push(...fresh);
+      appendCards(fresh);
     }
     // Refresh art/meta inside an open sheet - but never while the user
     // is mid-correction: re-rendering would close the fix panel and
@@ -4482,7 +4491,10 @@ const refresh=()=>wallFetch(true);
 // re-checks - a sentinel that was already in view (short first page)
 // would otherwise never trigger again.
 function maybeMore(){
-  if(view==='releases'||wloading||cards.length>=wtotal) return;
+  // + wskew: arrivals above the wall are counted in wtotal but never
+  // appended (GH #325), so cards alone would never reach the end and the
+  // scroll would keep asking for empty pages.
+  if(view==='releases'||wloading||cards.length+wskew>=wtotal) return;
   const vh=innerHeight||document.documentElement.clientHeight||800;
   const r=document.getElementById('more').getBoundingClientRect();
   // top can go negative when the sentinel sits above a shrunk viewport
