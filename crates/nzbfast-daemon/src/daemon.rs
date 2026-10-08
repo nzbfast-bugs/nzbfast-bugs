@@ -30,6 +30,8 @@ mod daemon_enqueue;
 // child-module shape.
 #[path = "daemon_retry.rs"]
 mod daemon_retry;
+#[cfg(any(test, feature = "test-support"))]
+pub use daemon_retry::TEST_REDRIVE_PAUSE;
 
 // The queue on disk: save_queue out, load_queue back (TODO 106). Same
 // child-module shape.
