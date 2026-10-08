@@ -65,6 +65,34 @@ pub(crate) fn body_rate_floor() -> Option<RateFloor> {
     })
 }
 
+/// The OVER/XOVER path's [`RateFloor`] (#350). The header scan's
+/// collector treats ANY wire byte as progress and the reader's idle
+/// bound resets on every byte, so without a floor a server trickling an
+/// overview one byte a second held a scan pass - and the whole indexer
+/// lap behind it - forever. Same default shape as the body floor (64 B/s
+/// averaged over 60 s, far below any honest link);
+/// `NZBFAST_OVER_RATE_FLOOR` bytes/sec (0 disables) and
+/// `NZBFAST_OVER_RATE_WINDOW_SECS` override. Read per call, not cached:
+/// one env lookup is nothing next to an OVER round trip.
+pub(crate) fn over_rate_floor() -> Option<RateFloor> {
+    let bps = std::env::var("NZBFAST_OVER_RATE_FLOOR")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(BODY_RATE_FLOOR_BPS);
+    if bps == 0 {
+        return None;
+    }
+    let window = std::env::var("NZBFAST_OVER_RATE_WINDOW_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .map_or(BODY_RATE_WINDOW, std::time::Duration::from_secs);
+    Some(RateFloor {
+        window,
+        min_bytes: bps.saturating_mul(window.as_secs().max(1)),
+    })
+}
+
 /// The mid-body no-progress deadline a paced read holds each socket
 /// wait to. `Fixed` is the historical shape - one figure for the whole
 /// response, armed once per wait. `Live` asks the caller again once a

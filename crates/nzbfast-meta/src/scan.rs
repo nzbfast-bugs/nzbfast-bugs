@@ -2509,3 +2509,81 @@ mod primary_election_tests {
         assert_eq!(elect(&[(d, 100), (d, 900)]), 1);
     }
 }
+
+#[cfg(test)]
+mod trickle_over_scan {
+    use std::io::{BufRead as _, Write as _};
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU64;
+    use std::time::{Duration, Instant};
+
+    /// NNTP peer that answers GROUP normally, then answers OVER/XOVER with
+    /// "224" and trickles one byte per second forever.
+    fn trickler() -> u16 {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            while let Ok((mut s, _)) = l.accept() {
+                std::thread::spawn(move || {
+                    let mut r = std::io::BufReader::new(s.try_clone().unwrap());
+                    let _ = s.write_all(b"200 hi\r\n");
+                    let mut line = String::new();
+                    loop {
+                        line.clear();
+                        if r.read_line(&mut line).unwrap_or(0) == 0 {
+                            return;
+                        }
+                        let up = line.to_ascii_uppercase();
+                        if up.starts_with("GROUP") {
+                            let _ = s.write_all(b"211 1000 1 1000 alt.test\r\n");
+                        } else if up.starts_with("OVER") || up.starts_with("XOVER") {
+                            let _ = s.write_all(b"224 overview follows\r\n");
+                            loop {
+                                if s.write_all(b"1").is_err() {
+                                    return;
+                                }
+                                std::thread::sleep(Duration::from_secs(1));
+                            }
+                        } else {
+                            let _ = s.write_all(b"500 what\r\n");
+                        }
+                    }
+                });
+            }
+        });
+        port
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_one_byte_per_second_over_holds_the_scan_pass_forever() {
+        // Test-only short idle deadline: a SILENT worker is abandoned in 2 s.
+        unsafe { std::env::set_var("NZBFAST_SCAN_IDLE_SECS", "2") };
+        // Test-only short OVER rate-floor window (64 B/s over 2 s).
+        unsafe { std::env::set_var("NZBFAST_OVER_RATE_WINDOW_SECS", "2") };
+        let port = trickler();
+        let server: nzbkit::config::ServerConfig = serde_json::from_str(&format!(
+            r#"{{"host":"127.0.0.1","port":{port},"tls":false,"enabled":true,"connections":1}}"#
+        ))
+        .unwrap();
+        let dir = std::env::temp_dir().join(format!("nzbfast-trickle-over-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut ix = nzbkit::index::Index::open(&dir.join("index.db")).unwrap();
+        let progress = Arc::new(AtomicU64::new(0));
+        let t0 = Instant::now();
+        let r = tokio::time::timeout(
+            Duration::from_secs(15),
+            super::scan_article_range(
+                &server, "alt.test", "srv", 1, 1000, &mut ix, 0, Some(0),
+                Some(&progress), 0, Instant::now(), 1, false,
+            ),
+        )
+        .await;
+        assert!(
+            r.is_ok(),
+            "scan pass still running after {:?} against a 1 B/s OVER \
+             (idle deadline 2 s, rate-floor window 2 s)",
+            t0.elapsed()
+        );
+    }
+}
