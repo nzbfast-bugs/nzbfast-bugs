@@ -4586,9 +4586,10 @@ function manualUrl(a){ return MANUAL_BASE + (a?'#'+a:''); }
 let I18N={};                          // active catalogue ({} = English)
 // t(key, englishDefault, params) - {name} tokens are substituted.
 function t(k,en,p){
-  let s=I18N[k]??en;
-  if(p) for(const [a,b] of Object.entries(p)) s=s.split('{'+a+'}').join(b);
-  return s;
+  const s=I18N[k]??en;
+  // One pass over the TEMPLATE: a value is never re-scanned, so a release
+  // named "Show.{dest}" keeps its braces instead of taking {dest}'s value.
+  return p ? s.replace(/\{(\w+)\}/g,(m,a)=>Object.hasOwn(p,a)?String(p[a]):m) : s;
 }
 // Plural selection via CLDR categories (Intl.PluralRules). English yields
 // one|other; the Slavic locales (ru/pl/cs/uk/sk/hr/sr) yield one|few|many;
