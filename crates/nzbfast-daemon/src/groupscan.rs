@@ -716,11 +716,34 @@ pub fn kick_group_fetch(d: &Arc<Daemon>, config: PathBuf) -> bool {
     if d.group_fetching.swap(true, Ordering::SeqCst) {
         return false;
     }
+    // Clears the single-flight latch on EVERY exit - normal return, a
+    // panic in the task, or the runtime dropping it - so one bad fetch
+    // can never refuse every later kick until restart (#349).
+    struct Unlatch(Arc<Daemon>);
+    impl Drop for Unlatch {
+        fn drop(&mut self) {
+            self.0.group_fetching.store(false, Ordering::SeqCst);
+        }
+    }
     let d = d.clone();
     tokio::spawn(async move {
+        let _unlatch = Unlatch(d.clone());
         let prev = d.group_catalog.lock_ok().clone();
         let isc = d.group_desc_isc.load(Ordering::Relaxed);
-        match fetch_group_catalog(&config, prev.as_deref(), isc).await {
+        // Overall deadline: the multiline reads are only idle-bounded, so
+        // a server trickling LIST ACTIVE a byte at a time would otherwise
+        // hold this fetch (and the latch) forever.
+        let limit = group_fetch_deadline();
+        let res = match tokio::time::timeout(
+            limit,
+            fetch_group_catalog(&config, prev.as_deref(), isc),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => Err(format!("timed out after {}s", limit.as_secs())),
+        };
+        match res {
             Ok(cat) => {
                 if let Err(e) = cat.save(&d.groups_cache_path()) {
                     info!(target: "groups", "catalogue cache write failed: {e}");
@@ -750,9 +773,21 @@ pub fn kick_group_fetch(d: &Arc<Daemon>, config: PathBuf) -> bool {
                 *d.group_fetch_err.lock_ok() = Some(e);
             }
         }
-        d.group_fetching.store(false, Ordering::SeqCst);
     });
     true
+}
+
+/// Whole-fetch ceiling for [`kick_group_fetch`]. A full-feed LIST ACTIVE
+/// is several MB, so this is generous; `NZBFAST_GROUP_FETCH_SECS`
+/// overrides it (tests shorten it).
+#[cfg(feature = "indexer")]
+fn group_fetch_deadline() -> std::time::Duration {
+    let secs = std::env::var("NZBFAST_GROUP_FETCH_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(600);
+    std::time::Duration::from_secs(secs)
 }
 
 /// The newsgroup every diagnostic probe (system bench, connection ladder,
@@ -1072,6 +1107,77 @@ mod disabled_server_never_dialled {
             reached,
             ["enabled"],
             "the sampler must fall through to the first ENABLED server"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "indexer"))]
+mod trickle_catalog_fetch {
+    use std::io::{BufRead as _, Write as _};
+    use std::sync::atomic::Ordering;
+
+    /// NNTP peer: greets, answers LIST ACTIVE with 215, then trickles one
+    /// byte per second forever (never the terminating ".").
+    fn trickler() -> u16 {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            while let Ok((mut s, _)) = l.accept() {
+                std::thread::spawn(move || {
+                    let mut r = std::io::BufReader::new(s.try_clone().unwrap());
+                    let _ = s.write_all(b"200 hi\r\n");
+                    let mut line = String::new();
+                    loop {
+                        line.clear();
+                        if r.read_line(&mut line).unwrap_or(0) == 0 {
+                            return;
+                        }
+                        if line.starts_with("LIST ACTIVE") {
+                            let _ = s.write_all(b"215 list follows\r\n");
+                            loop {
+                                if s.write_all(b"a").is_err() {
+                                    return;
+                                }
+                                std::thread::sleep(std::time::Duration::from_secs(1));
+                            }
+                        }
+                        let _ = s.write_all(b"500 what\r\n");
+                    }
+                });
+            }
+        });
+        port
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_trickling_list_active_latches_the_catalogue_fetch_forever() {
+        unsafe { std::env::set_var("NZBFAST_GROUP_FETCH_SECS", "2") };
+        let dir = std::env::temp_dir().join(format!("nzbfast-trickle-cat-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = crate::testutil::test_daemon(&dir);
+        let port = trickler();
+        let cfg = dir.join("config.local.json");
+        std::fs::write(
+            &cfg,
+            format!(r#"{{"servers":[{{"host":"127.0.0.1","port":{port},"tls":false,"enabled":true,"connections":1}}]}}"#),
+        )
+        .unwrap();
+        assert!(super::kick_group_fetch(&d, cfg.clone()));
+        let t0 = std::time::Instant::now();
+        while t0.elapsed() < std::time::Duration::from_secs(10) {
+            if !d.group_fetching.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        let still = d.group_fetching.load(Ordering::SeqCst);
+        // Single-flight latch still held: every later kick is refused.
+        let refused = !super::kick_group_fetch(&d, cfg);
+        assert!(
+            !still,
+            "catalogue fetch still in flight after 10 s (2 s deadline) of a 1 B/s LIST ACTIVE \
+             (later kick refused: {refused}); no overall deadline exists"
         );
     }
 }
