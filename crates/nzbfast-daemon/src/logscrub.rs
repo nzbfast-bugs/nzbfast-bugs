@@ -150,7 +150,9 @@ impl LogScrub {
     ///
     /// So: keep the wide cut, and pay for it in a truncated banner.
     pub fn line(&self, s: &str) -> String {
-        let mut out = super::indexers::redact_url_creds(&super::indexers::redact_apikey(s));
+        let mut out = super::indexers::redact_url_creds(&redact_params(
+            &super::indexers::redact_apikey(s),
+        ));
         for (needle, with, blind) in &self.subs {
             out = if *blind {
                 replace_ignore_ascii_case(&out, needle, with)
@@ -161,10 +163,65 @@ impl LogScrub {
         out
     }
 
+    /// One line with its SECRETS blanked and nothing else touched: the
+    /// credential-shaped parameters and every `***` literal, but no URL
+    /// cut and no host/username placeholders. For "Create report", which
+    /// deliberately keeps hostnames and paths (see `report.rs`) yet must
+    /// not carry what the log door would have blanked.
+    pub fn secrets(&self, s: &str) -> String {
+        let mut out = redact_params(&super::indexers::redact_apikey(s));
+        for (needle, with, _) in self.subs.iter().filter(|(_, w, _)| w == "***") {
+            out = out.replace(needle.as_str(), with);
+        }
+        out
+    }
+
     /// A whole tail, scrubbed.
     pub fn tail(&self, lines: Vec<String>) -> Vec<String> {
         lines.iter().map(|l| self.line(l)).collect()
     }
+}
+
+/// Credential parameter names beyond `key=` (which `redact_apikey`
+/// already covers, `apikey=` and `api_key=` included as suffixes).
+/// `r=` is newznab's grab-link key (`getnzb/<guid>.nzb&i=..&r=<apikey>`,
+/// GHSA-v8ph-rq6w-3gp5). A bounded list on purpose: blanking every
+/// `x=` would eat ordinary log text.
+const SECRET_PARAMS: [&str; 2] = ["r", "token"];
+
+/// Blank the value of every [`SECRET_PARAMS`] parameter. A name only
+/// counts at a parameter boundary - right after `?`, `&` or `;` - so
+/// `per=` or `X-Plex-Token=` is not mistaken for `r=`/`token=`. Names
+/// match ASCII-case-blind; the value runs to the next `&`, `#` or
+/// whitespace, as in `redact_apikey`.
+pub fn redact_params(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut copied = 0;
+    let mut i = 0;
+    while i < b.len() {
+        if matches!(b[i], b'?' | b'&' | b';') {
+            let at = i + 1;
+            let hit = SECRET_PARAMS.iter().find(|n| {
+                let end = at + n.len();
+                end < b.len() && b[at..end].eq_ignore_ascii_case(n.as_bytes()) && b[end] == b'='
+            });
+            if let Some(n) = hit {
+                let v = at + n.len() + 1;
+                let len = s[v..]
+                    .find(|c: char| c == '&' || c == '#' || c.is_whitespace())
+                    .unwrap_or(s.len() - v);
+                out.push_str(&s[copied..v]);
+                out.push_str("***");
+                copied = v + len;
+                i = copied;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out.push_str(&s[copied..]);
+    out
 }
 
 /// `str::replace`, ASCII-case-blind on the needle.
