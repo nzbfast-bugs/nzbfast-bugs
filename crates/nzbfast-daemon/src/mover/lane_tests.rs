@@ -673,3 +673,59 @@ async fn mover_lane_bench() {
     let _ = std::fs::remove_dir_all(&root_one);
     let _ = std::fs::remove_dir_all(&root_two);
 }
+
+/// #337: a recategorize that snapshotted `out_dir` while the mover was
+/// mid-move, and claimed the fence only once the mover released it,
+/// must act on where the files are NOW - not see its stale source
+/// missing, relabel, and report success over a payload left behind.
+#[test]
+fn recategorize_after_a_move_rereads_out_dir_once_it_holds_the_fence() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _turn = rt.block_on(MOVE_DELAY_LOCK.lock());
+    let _delay = DelayGuard::set(400);
+    let dir = scratch("recat-reread");
+    let d = test_daemon(&dir);
+    let nas = dir.join("nas");
+    *d.move_completed.write_ok() = Some(nas.clone());
+    let job = pending_job(&d, "Rel.Recat", "tv");
+    let id = job.lock_ok().nzo_id.clone();
+
+    // The mover raises the fence, then sleeps (TEST_MOVE_DELAY_MS).
+    let (d1, j1) = (d.clone(), job.clone());
+    let mover = std::thread::spawn(move || d1.mover_process(&j1));
+    while !d.moving.lock_ok().contains(&id) {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // Hold the fence set's mutex: the recategorize can snapshot but not
+    // claim until the mover has committed and let go.
+    let mut g = d.moving.lock_ok();
+    let (d2, id2) = (d.clone(), id.clone());
+    let recat =
+        std::thread::spawn(move || crate::history::history_change_cat(&d2, &id2, "movies"));
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while job.lock_ok().move_pending {
+        assert!(std::time::Instant::now() < deadline, "mover never committed");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(!recat.is_finished(), "recategorize should be parked on the fence");
+    // Exactly what the mover's Fence drop does once it gets the lock.
+    g.remove(&id);
+    drop(g);
+    assert!(!mover.join().unwrap());
+    let r = recat.join().unwrap();
+
+    let j = job.lock_ok();
+    if r["status"] == true {
+        assert_eq!(j.category, "movies", "{r}");
+        assert!(
+            j.out_dir.starts_with(nas.join("movies")) && j.out_dir.join("payload.bin").is_file(),
+            "success reported but the payload is at {} under a 'movies' record: {r}",
+            j.out_dir.display()
+        );
+        assert_eq!(r["path"].as_str().unwrap(), j.out_dir.to_string_lossy(), "{r}");
+    } else {
+        assert_eq!(j.category, "tv", "a refusal must not relabel: {r}");
+        assert!(j.out_dir.join("payload.bin").is_file(), "{r}");
+    }
+}
