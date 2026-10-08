@@ -49,6 +49,15 @@ const MOVER_MAX_CONCURRENT: usize = 3;
 #[cfg(any(test, feature = "test-support"))]
 pub static TEST_MOVE_DELAY_MS: AtomicU64 = AtomicU64::new(0);
 
+/// Test-only: run between `mover_process`'s eligibility snapshot and its
+/// `moving` fence insert, for the job whose nzo_id is the key - the
+/// window a history delete can land in (#331). Keyed so parallel tests
+/// never fire each other's hook.
+#[cfg(test)]
+#[allow(clippy::type_complexity)]
+pub static TEST_PRE_FENCE_HOOK: Mutex<Option<(String, Box<dyn Fn() + Send>)>> =
+    Mutex::new(None);
+
 /// The device behind `root`, as a lane key. `None` when it cannot be
 /// resolved at all, which the caller turns into the shared lane.
 #[cfg(unix)]
@@ -546,6 +555,12 @@ impl Daemon {
             }
             (g.nzo_id.clone(), g.out_dir.clone(), g.category.clone())
         };
+        #[cfg(test)]
+        if let Some((hid, hook)) = mover::TEST_PRE_FENCE_HOOK.lock_ok().as_ref()
+            && *hid == id
+        {
+            hook();
+        }
         // Same fence as recategorize and redrive: deletes and retries
         // stand off while files are in flight.
         if !self.moving.lock_ok().insert(id.clone()) {
@@ -558,6 +573,34 @@ impl Daemon {
             }
         }
         let _fence = Fence(self.clone(), id);
+        // #331: the snapshot above was taken BEFORE the fence went up,
+        // and a history delete checks the fence, drops the row under the
+        // history lock, and only then tombstones - with no lock held in
+        // between. A delete that landed in that gap passed the fence
+        // check; re-ask now that the fence is visible. History lock
+        // first, then the job lock - the delete's own order. Under the
+        // history lock the answer is final: a delete that has not yet
+        // removed the row will meet the fence and refuse, and one that
+        // already did leaves the row missing here even before its
+        // tombstone lands. A record that is not in history at all (the
+        // mover only ever sees parked jobs) is treated the same way.
+        {
+            let h = self.history.lock_ok();
+            let listed = h.iter().any(|j| Arc::ptr_eq(j, job));
+            let mut g = job.lock_ok();
+            if !listed || !g.move_pending || g.state != JobState::Completed || g.tombstone {
+                // As the early-return arm: a tombstoned record's marker
+                // must not resurrect the move after a restart. A record
+                // merely unlisted keeps it - whoever took it owns it.
+                if g.tombstone {
+                    g.move_pending = false;
+                }
+                return false;
+            }
+            if g.finalizing {
+                return false;
+            }
+        }
         // Test-only: a move with visible width, so a test can watch the
         // lanes overlap (and the fleet cap hold) on a machine with one
         // volume, where every real move is an instant rename.
