@@ -58,18 +58,11 @@ pub fn retry_space_needed(j: &Job) -> u64 {
 pub fn history_change_cat(d: &Daemon, id: &str, cat: &str) -> Value {
     let target = d.history.lock_ok().iter().find_map(|j| {
         let g = j.lock_ok();
-        (g.nzo_id == id).then(|| {
-            (
-                j.clone(),
-                g.state,
-                g.category.clone(),
-                g.out_dir.clone(),
-                g.filed,
-                g.finalizing,
-            )
-        })
+        // Only what the pre-claim gates need: the rest is read again
+        // once the fence is held (#337).
+        (g.nzo_id == id).then(|| (j.clone(), g.category.clone(), g.finalizing))
     });
-    let Some((job, state, current, out_dir, filed, finalizing)) = target else {
+    let Some((job, current, finalizing)) = target else {
         return json!({"status": false,
             "error": "no job with that nzo_id (a job still downloading keeps its category until it finishes)"});
     };
@@ -117,9 +110,23 @@ pub fn history_change_cat(d: &Daemon, id: &str, cat: &str) -> Value {
         return json!({"status": false,
             "error": "no job with that nzo_id (it was removed just now)"});
     }
-    if job.lock_ok().finalizing {
-        return json!({"status": false,
-            "error": "post-processing is still running for this job - try again when it settles"});
+    // #337: everything else the snapshot read is stale too. A mover that
+    // held the fence while we waited has since rewritten `out_dir` (and
+    // `filed`); acting on the old path finds it empty, takes the
+    // relabel-only arm below, and reports success over files that never
+    // left the old category's folder. Re-read under the job lock now
+    // that the fence is ours, and decide everything from these values.
+    let (state, current, out_dir, filed) = {
+        let g = job.lock_ok();
+        if g.finalizing {
+            return json!({"status": false,
+                "error": "post-processing is still running for this job - try again when it settles"});
+        }
+        (g.state, g.category.clone(), g.out_dir.clone(), g.filed)
+    };
+    if current == cat {
+        return json!({"status": true, "moved": null,
+                      "path": out_dir.to_string_lossy(), "note": ""});
     }
     let mut split_error: Option<String> = None;
     // Nothing on disk to move: relabel and stop. Otherwise move_tree fails
