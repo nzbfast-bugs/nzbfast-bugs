@@ -1115,9 +1115,10 @@ const LOCALE=(()=>{
 })();
 let I18N={};
 function t(k,en,p){
-  let s=I18N[k]??en;
-  if(p) for(const [a,b] of Object.entries(p)) s=s.split('{'+a+'}').join(b);
-  return s;
+  const s=I18N[k]??en;
+  // One pass over the TEMPLATE: a value is never re-scanned, so a release
+  // named "Show.{dest}" keeps its braces instead of taking {dest}'s value.
+  return p ? s.replace(/\{(\w+)\}/g,(m,a)=>Object.hasOwn(p,a)?String(p[a]):m) : s;
 }
 // Plural via CLDR categories (Intl.PluralRules): English one|other, Slavic
 // one|few|many, Slovenian one|two|few|many. The lookup is category-generic,
