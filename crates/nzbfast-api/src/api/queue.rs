@@ -10,6 +10,7 @@ pub mod controls;
 mod files;
 mod payload;
 mod preview;
+mod retry;
 
 use caps::{cap_payload, planned_servers};
 // `pub` and not `pub(crate)` on the first three: `daemon_api_tests.rs`
@@ -1870,12 +1871,9 @@ pub(crate) fn dispatch(
         // directory under the new category, which is exactly what
         // a retry does.
         "change_cat" => return m_change_cat(d, req, params, ctx, api_body),
-        "retry" => {
-            let id = params.get("value").cloned().unwrap_or_default();
-            // The *arrs adopt the returned nzo_id as the new
-            // tracking id (SAB may reissue; we keep it stable).
-            json!({"status": d.retry(&id), "nzo_id": id})
-        }
+        // SAB's retry also takes `password` and an uploaded `nzbfile`
+        // (issue #328) - see `retry::m_retry`.
+        "retry" => return Some(retry::m_retry(d, req, params, api_body)),
         // Re-attempt ONLY the move to the completed folder for a
         // Completed history job whose move failed (Job::move_failed).
         // The drawer's own retry button: `retry` above would re-queue
@@ -2249,3 +2247,6 @@ mod cancelundo_tests;
 
 #[cfg(test)]
 mod histundo_tests;
+
+#[cfg(test)]
+mod retry_tests;
