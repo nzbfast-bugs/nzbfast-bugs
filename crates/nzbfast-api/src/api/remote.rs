@@ -253,7 +253,8 @@ pub(crate) fn rename_queued(
 /// value3 is how SAB spells "set this job's password" - LunaSea's
 /// set-password dialog sends the CURRENT name in value2 plus the
 /// password in value3, so a same-name rename must succeed for the
-/// password half to land. Queued jobs only, like SAB.
+/// password half to land. The rename itself is for queued jobs only;
+/// the password lands on a queued OR downloading job (issue #329).
 pub(crate) fn rename_arm(
     d: &Arc<Daemon>,
     params: &std::collections::HashMap<String, String>,
@@ -290,30 +291,76 @@ pub(crate) fn rename_arm(
         .filter(|j| hit_id(&j.lock_ok().nzo_id))
         .cloned()
         .collect();
+    // Issue #329. The password half is independent of the rename half:
+    // SAB sets a job's password wherever it sits in the queue, and
+    // LunaSea's set-password dialog re-sends the CURRENT name, so a
+    // password for the job that is downloading right now was refused
+    // with a bare `{"status": false}` because the (no-op) rename could
+    // not touch a started job. A same-name request no longer attempts
+    // the rename at all, and a started job still takes the password.
+    let wanted = nzbkit::disk::sanitize_filename(newname);
     let mut fences = Vec::new();
     let mut renamed: Vec<(Arc<Mutex<Job>>, String, Option<String>)> = Vec::new();
+    let mut refused: Vec<String> = Vec::new();
     for j in &targets {
-        let (old_name, old_pw) = {
+        let (old_name, old_pw, state, id) = {
             let g = j.lock_ok();
-            (g.name.clone(), g.password.clone())
+            (g.name.clone(), g.password.clone(), g.state, g.nzo_id.clone())
         };
-        if let Ok(fence) = rename_queued(d, j, newname) {
-            if let Some(pw) = pw {
-                j.lock_ok().password = Some(pw.to_string());
+        let takes_pw = matches!(state, JobState::Queued | JobState::Downloading);
+        if old_name == wanted || old_name == newname {
+            match pw {
+                Some(pw) if takes_pw => {
+                    j.lock_ok().password = Some(pw.to_string());
+                    renamed.push((j.clone(), old_name, old_pw));
+                }
+                Some(_) => refused.push(format!(
+                    "{id}: the password cannot be changed while the job is finishing"
+                )),
+                // Nothing asked for and nothing to do: already so.
+                None => renamed.push((j.clone(), old_name, old_pw)),
             }
-            fences.push(fence);
-            renamed.push((j.clone(), old_name, old_pw));
+            continue;
+        }
+        match rename_queued(d, j, newname) {
+            Ok(fence) => {
+                if let Some(pw) = pw {
+                    j.lock_ok().password = Some(pw.to_string());
+                }
+                fences.push(fence);
+                renamed.push((j.clone(), old_name, old_pw));
+            }
+            Err(e) => {
+                if let Some(pw) = pw.filter(|_| takes_pw) {
+                    j.lock_ok().password = Some(pw.to_string());
+                    renamed.push((j.clone(), old_name, old_pw));
+                    refused.push(format!(
+                        "{id}: the password was set, but the job cannot be renamed ({e})"
+                    ));
+                } else {
+                    refused.push(format!("{id}: the job cannot be renamed ({e})"));
+                }
+            }
         }
     }
-    if fences.is_empty() {
-        return json!({"status": false});
+    if renamed.is_empty() {
+        let error = if refused.is_empty() {
+            "no job in the queue with that nzo_id".to_string()
+        } else {
+            refused.join("; ")
+        };
+        return json!({"status": false, "error": error});
     }
     // Saved with every fence still held, and its verdict checked: a
     // refused store rolls the whole edit back - label, password, record
     // and moved bytes - before the fences lift, so nothing can start
     // against a half-undone rename (review C10).
     if d.save_queue() {
-        json!({"status": true})
+        let mut out = json!({"status": true});
+        if !refused.is_empty() {
+            out["warning"] = json!(refused.join("; "));
+        }
+        out
     } else {
         for (j, old_name, old_pw) in renamed {
             let mut g = j.lock_ok();
@@ -466,5 +513,101 @@ mod tests {
 
         drop(d);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn rename_rig(tag: &str) -> (std::path::PathBuf, Arc<Daemon>, Arc<Mutex<Job>>) {
+        let dir = std::env::temp_dir().join(format!("nzbfast-renpw-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let d = test_daemon(&dir);
+        let job = Arc::new(Mutex::new(
+            job_from_json(&json!({
+                "nzo_id": "SABnzbd_nzo_pw", "name": "Job.A",
+                "nzb_path": "/tmp/x.nzb", "out_dir": crate::naming::out_dir(&d).join("Job.A"),
+                "state": "Queued",
+            }))
+            .expect("job_from_json"),
+        ));
+        d.queue.lock_ok().push_back(job.clone());
+        (dir, d, job)
+    }
+
+    fn params(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+        pairs.iter().map(|(k, v)| ((*k).to_string(), (*v).to_string())).collect()
+    }
+
+    /// Issue #329: LunaSea's set-password (current name + value3) on the
+    /// job that is downloading lands the password.
+    #[test]
+    fn a_password_lands_on_the_downloading_job() {
+        let (dir, d, job) = rename_rig("dl");
+        job.lock_ok().state = JobState::Downloading;
+        let v = rename_arm(
+            &d,
+            &params(&[("value", "SABnzbd_nzo_pw"), ("value2", "Job.A"), ("value3", "s3cret")]),
+        );
+        let (pw, name) = {
+            let g = job.lock_ok();
+            (g.password.clone(), g.name.clone())
+        };
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(v["status"], true, "{v}");
+        assert_eq!(pw.as_deref(), Some("s3cret"));
+        assert_eq!(name, "Job.A");
+    }
+
+    /// A real rename of a started job is still refused - with words -
+    /// but a password riding it still lands.
+    #[test]
+    fn a_started_job_refuses_the_rename_and_says_why() {
+        let (dir, d, job) = rename_rig("ref");
+        job.lock_ok().state = JobState::Downloading;
+        let v = rename_arm(&d, &params(&[("value", "SABnzbd_nzo_pw"), ("value2", "Job.B")]));
+        assert_eq!(v["status"], false, "{v}");
+        assert!(v["error"].as_str().is_some_and(|e| e.contains("cannot be renamed")), "{v}");
+        assert_eq!(job.lock_ok().name, "Job.A");
+
+        let v = rename_arm(
+            &d,
+            &params(&[("value", "SABnzbd_nzo_pw"), ("value2", "Job.B"), ("value3", "pw2")]),
+        );
+        let (pw, name) = {
+            let g = job.lock_ok();
+            (g.password.clone(), g.name.clone())
+        };
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(v["status"], true, "{v}");
+        assert!(v["warning"].as_str().is_some_and(|e| e.contains("cannot be renamed")), "{v}");
+        assert_eq!(pw.as_deref(), Some("pw2"));
+        assert_eq!(name, "Job.A");
+    }
+
+    /// A same-name request on a queued job sets the password and does
+    /// not re-derive the directory (no `.2` climb).
+    #[test]
+    fn a_same_name_request_does_not_rename() {
+        let (dir, d, job) = rename_rig("same");
+        let before = job.lock_ok().out_dir.clone();
+        let v = rename_arm(
+            &d,
+            &params(&[("value", "SABnzbd_nzo_pw"), ("value2", "Job.A"), ("value3", "x")]),
+        );
+        let (pw, out) = {
+            let g = job.lock_ok();
+            (g.password.clone(), g.out_dir.clone())
+        };
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(v["status"], true, "{v}");
+        assert_eq!(pw.as_deref(), Some("x"));
+        assert_eq!(out, before);
+    }
+
+    #[test]
+    fn an_unknown_id_says_so() {
+        let (dir, d, _job) = rename_rig("unk");
+        let v = rename_arm(&d, &params(&[("value", "SABnzbd_nzo_nope"), ("value2", "X")]));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(v["status"], false, "{v}");
+        assert!(v["error"].as_str().is_some_and(|e| !e.is_empty()), "{v}");
     }
 }
