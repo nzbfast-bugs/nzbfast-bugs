@@ -54,6 +54,16 @@ pub(crate) fn spot_fetch_conns(connections: u32, pending: usize) -> usize {
 /// long pole and there is nothing left to buy.
 pub(crate) const SPOT_FETCH_CONNS_MAX: usize = 8;
 
+/// Issue #347: the ceiling on ONE spot fetch (a HEAD plus a few small
+/// BODYs), matching nzbimport's and PULL's 120 s. The reader's idle
+/// bound resets on every byte, so without this a peer dribbling a byte
+/// a second holds a fetcher forever. Shortened under test so the
+/// trickle regression runs in seconds.
+#[cfg(not(test))]
+const SPOT_FETCH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+#[cfg(test)]
+const SPOT_FETCH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// One budgeted spot-NZB resolver pass (E3 / TODO 131): fetch the NZB
 /// for spots that have no release row yet and fold each into the index -
 /// a fresh named release normally, an upgrade of the row our scanner
@@ -170,9 +180,20 @@ pub async fn spot_resolve_pass(
                 }
                 let idx = cursor.fetch_add(1, Ordering::Relaxed);
                 let Some(mid) = msgids.get(idx) else { break };
-                let sent = match nzbkit::spot::fetch_spot_nzb(conn.as_mut().unwrap(), mid).await {
-                    Ok((sx, bytes)) => tx.send(SpotFetch::Got { idx, sx, bytes }).await,
-                    Err(_) => {
+                // Issue #347: a whole-fetch deadline. The reader's idle
+                // bound resets on every byte, so a peer dribbling one
+                // byte a second held this worker - and, once every
+                // worker was held, the whole pass - indefinitely. A
+                // timeout is a fetch error like any other: Failed, and
+                // the half-read session is dropped below.
+                let fetched = tokio::time::timeout(
+                    SPOT_FETCH_DEADLINE,
+                    nzbkit::spot::fetch_spot_nzb(conn.as_mut().unwrap(), mid),
+                )
+                .await;
+                let sent = match fetched {
+                    Ok(Ok((sx, bytes))) => tx.send(SpotFetch::Got { idx, sx, bytes }).await,
+                    Ok(Err(_)) | Err(_) => {
                         // Drop the session on ANY fetch error. A BODY
                         // that died mid-read still owes us the rest of
                         // its dot-stuffed payload, so the next command
@@ -227,7 +248,23 @@ pub async fn spot_resolve_pass(
     // slot is survivable, every worker losing it is the unreachable
     // server the serial pass used to fail outright on.
     let mut connect_err: Option<String> = None;
-    while let Some(msg) = rx.recv().await {
+    // Issue #347: `stop()` must not be starved when every worker is
+    // blocked and no result arrives - poll it on a tick as well.
+    let mut stop_tick = tokio::time::interval(std::time::Duration::from_millis(250));
+    stop_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        let msg = tokio::select! {
+            m = rx.recv() => match m {
+                Some(m) => m,
+                None => break,
+            },
+            _ = stop_tick.tick() => {
+                if stop() {
+                    break;
+                }
+                continue;
+            }
+        };
         match msg {
             SpotFetch::NoConnection(e) => {
                 connect_err = Some(e);
