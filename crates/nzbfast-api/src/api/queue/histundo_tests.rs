@@ -508,3 +508,71 @@ fn the_history_undo_store_does_not_survive_a_restart() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// GH #341: undoing a delete of a row that still OWED a move. The
+/// mover popped the row while it was tombstoned and spent its
+/// `move_pending` marker; the undo puts the row back with that marker
+/// gone, so the payload never reaches the completed folder.
+#[test]
+fn an_undone_delete_keeps_the_move_the_row_owed() {
+    let dir = tmp("movepending");
+    let d = test_daemon(&dir);
+    let nas = dir.join("nas");
+    std::fs::create_dir_all(&nas).unwrap();
+    *d.move_completed.write_ok() = Some(nas.clone());
+    let job = filed(&d, "SABnzbd_nzo_mp", "Owed.Move");
+    job.lock_ok().move_pending = true;
+    let src = job.lock_ok().out_dir.clone();
+
+    let j = hist_delete_arm(&d, &params(&[("name", "delete")]), "SABnzbd_nzo_mp");
+    let token = j["undo"]["token"].as_str().expect("token").to_string();
+    // The mover's queued Arc pops inside the window (a backlog ahead of it).
+    assert!(!d.mover_process(&job));
+    let back = hist_undelete_arm(&d, &token);
+    assert_eq!(back["status"], serde_json::json!(true), "{back}");
+    assert_eq!(ids(&d), ["SABnzbd_nzo_mp"]);
+    // Any later mover pass on the restored row.
+    let _ = d.mover_process(&job);
+    let g = job.lock_ok();
+    assert!(
+        g.move_pending || g.out_dir != src,
+        "restored row no longer owes its move: out_dir={} move_pending={} - payload \
+         stranded in the download folder",
+        g.out_dir.display(),
+        g.move_pending
+    );
+}
+
+/// GH #341: undoing a delete of a row that still OWED a move. The
+/// mover popped the row while it was tombstoned and spent its
+/// `move_pending` marker; the undo puts the row back with that marker
+/// gone, so the payload never reaches the completed folder.
+#[test]
+fn an_undone_delete_with_no_mover_pass_still_moves() {
+    let dir = tmp("mpctl");
+    let d = test_daemon(&dir);
+    let nas = dir.join("nas");
+    std::fs::create_dir_all(&nas).unwrap();
+    *d.move_completed.write_ok() = Some(nas.clone());
+    let job = filed(&d, "SABnzbd_nzo_mp", "Owed.Move");
+    job.lock_ok().move_pending = true;
+    let src = job.lock_ok().out_dir.clone();
+
+    let j = hist_delete_arm(&d, &params(&[("name", "delete")]), "SABnzbd_nzo_mp");
+    let token = j["undo"]["token"].as_str().expect("token").to_string();
+    // The mover's queued Arc pops inside the window (a backlog ahead of it).
+    // control: no pop in the window
+    let back = hist_undelete_arm(&d, &token);
+    assert_eq!(back["status"], serde_json::json!(true), "{back}");
+    assert_eq!(ids(&d), ["SABnzbd_nzo_mp"]);
+    // Any later mover pass on the restored row.
+    let _ = d.mover_process(&job);
+    let g = job.lock_ok();
+    assert!(
+        g.move_pending || g.out_dir != src,
+        "restored row no longer owes its move: out_dir={} move_pending={} - payload \
+         stranded in the download folder",
+        g.out_dir.display(),
+        g.move_pending
+    );
+}
