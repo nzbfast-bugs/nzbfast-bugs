@@ -62,6 +62,11 @@ pub(crate) static PARK_GEN_BARRIER: Mutex<
 /// stretch behind it went unexercised while the suite stayed green. The
 /// prewrite is disk I/O, so this is a real window and a zero-width one
 /// without a seam. Same keyed two-stage shape, for the same reason.
+/// GH #342 test seam: runs between the claimant check and the removal in
+/// `drop_failed_payload_now`.
+#[cfg(test)]
+pub(crate) static BUGHUNT_DROP_PAUSE: Mutex<Option<Box<dyn FnOnce() + Send>>> = Mutex::new(None);
+
 #[cfg(test)]
 pub(crate) static PARK_PREWRITE_BARRIER: Mutex<
     Option<(String, Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
@@ -1595,11 +1600,40 @@ impl Daemon {
             );
             return;
         }
+        #[cfg(test)]
+        if let Some(hook) = BUGHUNT_DROP_PAUSE.lock_ok().take() {
+            hook();
+        }
         let (dir, name, filed, tail) = {
             let g = job.lock_ok();
             let t = delete_tail(&g, || crate::naming::job_suffix(self, filed_stem(&g)));
             (g.out_dir.clone(), filed_stem(&g).to_string(), g.filed, t)
         };
+        // GH #342: fence FIRST, then re-check. The claimant check above
+        // is a snapshot, and a Retry landing after it re-queued this job
+        // in place - into the very folder removed below. With the
+        // reservation up, a retry from here on sees the folder as Active
+        // and refiles into a fresh one; a retry that already happened is
+        // caught by the re-check, which stands down.
+        let fenced = self.reserved.lock_ok().insert(dir.clone());
+        let still_ours = self.history.lock_ok().iter().any(|j| {
+            Arc::ptr_eq(j, job) && {
+                let g = j.lock_ok();
+                g.state == JobState::Failed && !g.tombstone && g.out_dir == dir
+            }
+        });
+        if !still_ours {
+            if fenced {
+                self.reserved.lock_ok().remove(&dir);
+            }
+            info!(
+                target: "queue",
+                "{id}: failed, but it was retried or removed before its files \
+                 could be - {} kept",
+                dir.display()
+            );
+            return;
+        }
         let sidecar = self.sidecar_owner();
         match self.remove_files_in_custody(
             sidecar.as_ref(),
@@ -2864,6 +2898,34 @@ mod failed_payload_tests {
 
     /// A folder another record still names is not this failure's to
     /// remove - the claimant check the history delete takes.
+    /// GH #342: a Retry landing after the worker's claimant check
+    /// re-queues the job IN its old folder, and the worker then removes
+    /// that folder out from under the queued job.
+    #[test]
+    fn a_retry_between_check_and_removal_keeps_the_queued_jobs_folder() {
+        let dir = scratch("retryrace");
+        let d = test_daemon(&dir);
+        d.failed_delete_files.store(true, Ordering::Relaxed);
+        let out = crate::naming::out_dir(&d).join("Bad.Release");
+        let job = failed_job(&d, "nzo-fail-retry", &out);
+        let d2 = d.clone();
+        *BUGHUNT_DROP_PAUSE.lock_ok() = Some(Box::new(move || {
+            assert!(d2.retry("nzo-fail-retry"), "retry refused");
+        }));
+        d.park_drop_failed_payload(&job, "nzo-fail-retry", FAILED);
+        settle();
+        let g = job.lock_ok();
+        let queued = d.queue.lock_ok().iter().any(|j| Arc::ptr_eq(j, &job));
+        assert!(queued, "retry did not re-queue");
+        assert_eq!(g.state, JobState::Queued);
+        assert!(
+            g.out_dir != out || out.join("rel.part01.rar").exists(),
+            "the RETRIED, queued job's folder {} (its out_dir) was removed by the \
+             failed-payload worker",
+            g.out_dir.display()
+        );
+    }
+
     #[test]
     fn a_folder_a_queued_job_shares_is_kept() {
         let dir = scratch("shared");
