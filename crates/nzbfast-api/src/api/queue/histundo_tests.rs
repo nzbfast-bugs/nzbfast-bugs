@@ -334,7 +334,7 @@ fn an_emptied_held_copy_refuses_instead_of_restoring() {
 
     let j = hist_delete_arm(&d, &params(&[("name", "delete")]), "SABnzbd_nzo_hi");
     let token = j["undo"]["token"].as_str().expect("token").to_string();
-    let held = d.cancel_undo_dir().join("hist-SABnzbd_nzo_hi.nzb");
+    let held = d.hist_undo.lock_ok()[0].rows[0].held.clone();
     assert!(held.exists(), "nothing was held: {}", held.display());
     std::fs::write(&held, b"").expect("empty the held copy");
 
@@ -483,7 +483,7 @@ fn the_history_undo_store_does_not_survive_a_restart() {
 
     let j = hist_delete_arm(&d, &params(&[("name", "delete")]), "SABnzbd_nzo_hn");
     assert!(j["undo"]["token"].is_string(), "no token: {j}");
-    let held = d.cancel_undo_dir().join("hist-SABnzbd_nzo_hn.nzb");
+    let held = d.hist_undo.lock_ok()[0].rows[0].held.clone();
     assert!(held.exists(), "nothing was held");
 
     // What a start does, in the order a start does it. A second
@@ -505,6 +505,46 @@ fn the_history_undo_store_does_not_survive_a_restart() {
         "the retained copy outlived the restart that made it unreachable: {}",
         held.display()
     );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// GH #330: two live tokens for ONE nzo_id each keep their own NZB.
+///
+/// The same history id is deleted, comes back (filed again, as a
+/// retry-then-finish would), and is deleted again inside the window.
+/// When the OLDER token expires its sweep must unlink only its own
+/// copy, so the newer token still restores a retryable entry.
+#[test]
+fn an_older_history_tokens_expiry_leaves_a_newer_tokens_nzb_alone() {
+    let dir = tmp("twotokens");
+    let d = test_daemon(&dir);
+    filed(&d, "SABnzbd_nzo_h2", "Again.Release");
+    let j1 = hist_delete_arm(&d, &params(&[("name", "delete")]), "SABnzbd_nzo_h2");
+    let t1 = j1["undo"]["token"].as_str().expect("token 1").to_string();
+
+    let job = filed(&d, "SABnzbd_nzo_h2", "Again.Release");
+    let j2 = hist_delete_arm(&d, &params(&[("name", "delete")]), "SABnzbd_nzo_h2");
+    let t2 = j2["undo"]["token"].as_str().expect("token 2").to_string();
+
+    // Token 1's window closes; token 2's does not.
+    for b in d.hist_undo.lock_ok().iter_mut() {
+        if b.token == t1 {
+            b.at -= nzbfast_daemon::cancelundo::CANCEL_UNDO_SECS as i64 + 1;
+        }
+    }
+    d.sweep_hist_undo();
+
+    let back = hist_undelete_arm(&d, &t2);
+    assert_eq!(
+        back["status"],
+        serde_json::json!(true),
+        "newer undo lost its NZB when old token expired: {back}"
+    );
+    assert_eq!(back["failed"], serde_json::json!([]), "{back}");
+    assert_eq!(ids(&d), ["SABnzbd_nzo_h2"]);
+    let bytes = std::fs::read(&job.lock_ok().nzb_path).expect("no spool copy");
+    assert!(nzbkit::nzb::Nzb::parse(&bytes).is_ok());
 
     let _ = std::fs::remove_dir_all(&dir);
 }
