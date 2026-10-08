@@ -162,6 +162,10 @@ impl Daemon {
         let Some(job) = self.history_job(nzo_id) else {
             return false;
         };
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(f) = TEST_REDRIVE_PAUSE.lock().unwrap().take() {
+            f();
+        }
         // Same fence pair the recategorize path takes, for the same
         // reasons: `moving` keeps deletes/retries off the payload while
         // files are in flight, and `finalizing` means the tail already
@@ -179,8 +183,21 @@ impl Daemon {
         }
         let claim = MoveClaim(self.clone(), nzo_id.to_string());
         let (out_dir, cat) = {
+            // #339: the lookup above ran before the fence went up, so a
+            // delete could have taken the record out in between (its
+            // `moving` check passed - there was no fence yet). Re-verify
+            // under the history lock, then the job lock - the delete's
+            // order - that this exact record is still filed and live.
+            let h = self.history.lock_ok();
+            let present = h.iter().any(|j| Arc::ptr_eq(j, &job));
             let mut g = job.lock_ok();
-            if g.state != JobState::Completed || g.finalizing || g.move_failed.is_empty() {
+            drop(h);
+            if !present
+                || g.tombstone
+                || g.state != JobState::Completed
+                || g.finalizing
+                || g.move_failed.is_empty()
+            {
                 return false; // claim drops here, releasing the fence
             }
             // Disarm before the attempt so a success does not leave a
@@ -504,3 +521,8 @@ impl Daemon {
         true
     }
 }
+
+/// Test-only seam (bug hunt): runs once between the history lookup and the fence.
+#[cfg(any(test, feature = "test-support"))]
+pub static TEST_REDRIVE_PAUSE: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>> =
+    std::sync::Mutex::new(None);
