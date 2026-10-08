@@ -211,10 +211,19 @@ impl Daemon {
         // under the same nzo_id, so the two halves can legitimately name
         // one id minutes apart and an unprefixed name would hand one
         // half the other's NZB.
-        let dest = dir.join(format!("hist-{}.nzb", g.nzo_id));
-        // A leftover under this name is from an earlier delete of the
-        // same id whose window has since been swept; `hard_link` fails
-        // on an existing destination, so it goes first.
+        //
+        // Plus a per-copy sequence (GH #330), for the reason
+        // `retain_for_undo` gives: two live tokens for one id must not
+        // share a path, or the older one's expiry unlinks the newer
+        // one's copy.
+        let dest = dir.join(format!(
+            "hist-{}.{}.nzb",
+            g.nzo_id,
+            super::cancelundo::next_held_seq()
+        ));
+        // Unique per process, so a leftover can only be from a previous
+        // run; `hard_link` fails on an existing destination, so it goes
+        // first.
         let _ = std::fs::remove_file(&dest);
         if let Err(link_err) = std::fs::hard_link(&g.nzb_path, &dest) {
             // No links on this filesystem (exFAT, some SMB mounts), or

@@ -224,7 +224,7 @@ fn an_emptied_copy_refuses_instead_of_restoring_an_unrunnable_row() {
     let token = j["undo"]["token"].as_str().expect("token").to_string();
 
     // What the fault path does, done to the retained copy directly.
-    let held = d.cancel_undo_dir().join(format!("{}.nzb", e.nzo_id));
+    let held = d.cancel_undo.lock_ok()[0].rows[0].nzb.clone();
     assert!(held.exists(), "nothing was held: {}", held.display());
     std::fs::write(&held, b"").expect("empty the held copy");
 
@@ -329,7 +329,7 @@ fn the_undo_store_does_not_survive_a_restart_or_tempt_the_recovery() {
         )
         .expect("enqueue");
     payload::delete_arm(&d, &params(&[("name", "delete")]), "delete", &e.nzo_id);
-    let held = d.cancel_undo_dir().join(format!("{}.nzb", e.nzo_id));
+    let held = d.cancel_undo.lock_ok()[0].rows[0].nzb.clone();
     assert!(held.exists(), "nothing was held");
 
     // What a start does, in the order a start does it.
@@ -578,6 +578,70 @@ fn an_undo_leaves_a_completed_payload_at_the_old_path_alone() {
         b"a verified result",
         "the completed result was disturbed"
     );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// GH #330: two live tokens for ONE nzo_id each keep their own NZB.
+///
+/// The id comes back under its original name (an *arr re-push,
+/// `recover_orphaned_spool`) and is cancelled again inside the window,
+/// so two batches hold a copy for the same id. When the OLDER token
+/// expires, its sweep must unlink only its own copy: the newer token is
+/// still inside its window and must still restore.
+#[test]
+fn an_older_tokens_expiry_leaves_a_newer_tokens_nzb_alone() {
+    let dir = tmp("twotokens");
+    let d = test_daemon(&dir);
+    let e = d
+        .enqueue(
+            NZB,
+            "Again.Release.nzb",
+            "",
+            -100,
+            None,
+            None,
+            "test",
+            false,
+        )
+        .expect("enqueue");
+    let id = e.nzo_id.clone();
+    let j1 = payload::delete_arm(&d, &params(&[("name", "delete")]), "delete", &id);
+    let t1 = j1["undo"]["token"].as_str().expect("token 1").to_string();
+
+    // The same id comes back without spending token 1.
+    d.enqueue_as(
+        Some(&id),
+        NZB,
+        "Again.Release.nzb",
+        "",
+        -100,
+        None,
+        None,
+        "test",
+        DupeExempt::Anybody,
+        None,
+    )
+    .expect("re-add under the same id");
+    let j2 = payload::delete_arm(&d, &params(&[("name", "delete")]), "delete", &id);
+    let t2 = j2["undo"]["token"].as_str().expect("token 2").to_string();
+
+    // Token 1's window closes; token 2's does not.
+    for b in d.cancel_undo.lock_ok().iter_mut() {
+        if b.token == t1 {
+            b.at -= nzbfast_daemon::cancelundo::CANCEL_UNDO_SECS as i64 + 1;
+        }
+    }
+    d.sweep_cancel_undo();
+
+    let back = payload::undelete_arm(&d, &t2);
+    assert_eq!(
+        back["status"],
+        serde_json::json!(true),
+        "newer undo lost its NZB when old token expired: {back}"
+    );
+    assert_eq!(back["failed"], serde_json::json!([]), "{back}");
+    assert_eq!(d.queue.lock_ok().len(), 1, "token 2 did not restore the job");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
