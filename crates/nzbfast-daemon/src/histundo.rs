@@ -133,6 +133,11 @@ pub struct HistUndoRow {
     pub nzb_path: PathBuf,
     /// The retained link, under `<spool>/undo/`.
     pub held: PathBuf,
+    /// GH #341: whether the record still owed the mover a visit when the
+    /// delete found it. Captured here because the mover, popping the
+    /// tombstoned row inside the window, spends `move_pending` - so the
+    /// record itself can no longer say so by the time the undo runs.
+    pub owed_move: bool,
 }
 
 /// One delete request's worth of rows, spent as a unit.
@@ -238,6 +243,7 @@ impl Daemon {
             nzo_id: g.nzo_id.clone(),
             nzb_path: g.nzb_path.clone(),
             held: dest,
+            owed_move: g.move_pending,
         })
     }
 
@@ -355,6 +361,7 @@ impl Daemon {
         let mut out = HistUndoOutcome::default();
         let mut back: Vec<(usize, Arc<Mutex<Job>>)> = Vec::new();
         let mut names: Vec<String> = Vec::new();
+        let mut owed: Vec<Arc<Mutex<Job>>> = Vec::new();
         for row in batch.rows {
             if self.id_is_live(&row.nzo_id) {
                 out.failed.push(format!(
@@ -374,7 +381,18 @@ impl Daemon {
             // row carrying early copies never got a token in the first
             // place (`retain_hist_for_undo`), so `early_take` found
             // nothing to take.
-            row.job.lock_ok().tombstone = false;
+            {
+                let mut g = row.job.lock_ok();
+                g.tombstone = false;
+                // GH #341: the second stamp. A mover pass during the
+                // window cleared the owed move; put it back, and hand
+                // the row to the mover again below (a second enqueue of
+                // a row it has not reached yet is a harmless no-op).
+                if row.owed_move && g.state == JobState::Completed {
+                    g.move_pending = true;
+                    owed.push(row.job.clone());
+                }
+            }
             let _ = std::fs::remove_file(&row.held);
             names.push(row.name.clone());
             out.restored.push(row.nzo_id.clone());
@@ -385,6 +403,9 @@ impl Daemon {
         }
         let jobs: Vec<Arc<Mutex<Job>>> = back.iter().map(|(_, j)| j.clone()).collect();
         self.history_restore(back);
+        for j in &owed {
+            self.mover_enqueue(j);
+        }
         if !self.history_upsert(&jobs) && !self.history_compact() {
             // Both refused: a data folder this daemon cannot write at
             // all. The rows ARE back and a live daemon carries on with
