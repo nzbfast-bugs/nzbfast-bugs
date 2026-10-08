@@ -2328,7 +2328,9 @@ impl Connection {
         // Credit the wire as it arrives, so a caller watching a whole
         // chunk can tell a slow OVER from a dead one. The two arms are
         // otherwise byte for byte what `read_multiline_into` and the
-        // sink-less gzip read did: same bound, same ceiling, no floor.
+        // sink-less gzip read did: same bound, same ceiling. The plain arm
+        // also carries the OVER rate floor (#350): the idle bound resets on
+        // every byte, so without it a 1 B/s trickle never ends the read.
         let watched = self.over_progress.is_some();
         let counter = self.over_progress.clone();
         // A plain local closure, not a boxed one: `Arrivals` is a
@@ -2349,7 +2351,7 @@ impl Connection {
                 &mut raw,
                 STREAM_IDLE_TIMEOUT,
                 MAX_MULTILINE_BYTES,
-                None,
+                over_rate_floor(),
                 arrivals,
             )
             .await
