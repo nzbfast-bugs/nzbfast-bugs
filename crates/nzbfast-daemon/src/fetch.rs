@@ -177,8 +177,32 @@ pub fn name_from_fetch(f: &Fetched, url: &str) -> Option<String> {
         return Some(f.filename.clone());
     }
     let path = url.split(['?', '#']).next().unwrap_or("");
-    let tail = path.rsplit('/').next().unwrap_or("").trim();
+    let tail = path.rsplit('/').next().unwrap_or("");
+    // Newznab grab links append their parameters to the PATH with no
+    // `?` in front: `getnzb/<guid>.nzb&i=<uid>&r=<apikey>`. Everything
+    // from the first `&name=` on is parameters, and `r=` is the user's
+    // key, so it must never become the job name (GHSA-v8ph-rq6w-3gp5).
+    // Cutting at an `&` that STARTS a `name=` pair, rather than at any
+    // `&`, keeps a literal `Tom & Jerry.nzb`, and rather than at a fixed
+    // list of names, also drops parameters an indexer adds later.
+    let tail = tail[..path_params_start(tail)].trim();
     (!tail.is_empty()).then(|| tail.to_string())
+}
+
+/// Byte offset of the first `&name=` in `s` (`name` = one or more ASCII
+/// alphanumerics or `_`), or `s.len()` when there is none.
+fn path_params_start(s: &str) -> usize {
+    let b = s.as_bytes();
+    for (i, _) in s.match_indices('&') {
+        let n = b[i + 1..]
+            .iter()
+            .take_while(|c| c.is_ascii_alphanumeric() || **c == b'_')
+            .count();
+        if n > 0 && b.get(i + 1 + n) == Some(&b'=') {
+            return i;
+        }
+    }
+    s.len()
 }
 
 /// One `X-DNZB-*` header, trimmed, or empty.

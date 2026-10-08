@@ -279,3 +279,24 @@ fn a_path_borne_credential_leaves_with_its_path_gone() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// GHSA-v8ph-rq6w-3gp5: a newznab grab link spells its key as a PATH
+/// suffix (`getnzb/<guid>.nzb&i=<uid>&r=<apikey>`). Whatever carries
+/// that text into the ring - an old job name, a library error - the log
+/// door blanks the `r=` value, and `token=` with it, for a key this
+/// install has never been told about.
+#[test]
+fn the_log_door_blanks_a_newznab_r_key_and_tokens() {
+    let dir = scratch("rtoken");
+    let d = test_daemon(&dir);
+    let s = LogScrub::new(&d);
+    let got = s.line("[failurelink] 0123abcd.nzb&i=42&r=SECRETRSSKEY0123456789: failure reported");
+    // The value runs to whitespace, as in `redact_apikey`, so the
+    // trailing `:` goes with it - over-redacting is the safe side.
+    assert_eq!(got, "[failurelink] 0123abcd.nzb&i=42&r=*** failure reported");
+    let got = s.line("feed ?token=TOKSECRET99&x=1 failed");
+    assert!(!got.contains("TOKSECRET99"), "{got}");
+    // Only at a parameter boundary: prose and look-alike names stay.
+    assert_eq!(s.line("per=5 X-Plex-Token=abc"), "per=5 X-Plex-Token=abc");
+    let _ = std::fs::remove_dir_all(&dir);
+}

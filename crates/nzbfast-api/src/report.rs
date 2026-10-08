@@ -491,7 +491,12 @@ fn render_report(d: &Daemon, nzo_id: &str, job: &Arc<Mutex<Job>>) -> String {
         );
     }
     drop(j);
-    scrub(&o, home.as_deref())
+    // The log door's secret rules too (GHSA-v8ph-rq6w-3gp5): this slice
+    // is the same ring `mode=log` scrubs, and a report is MADE to be
+    // pasted. `secrets` blanks credentials only - hostnames and paths
+    // stay, as the module note promises. Built after the record is
+    // released: it reads config and several daemon locks.
+    super::logscrub::LogScrub::new(d).secrets(&scrub(&o, home.as_deref()))
 }
 
 /// The live shortfall verdict for this job, with the numbers behind
@@ -782,6 +787,41 @@ fn report_nzb(path: &std::path::Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// GHSA-v8ph-rq6w-3gp5: "Create report" blanks what the log door
+    /// blanks - a newznab `&r=` key, a `token=`, the daemon's own API
+    /// key - while keeping the hostname and path it promises to keep.
+    #[test]
+    fn the_report_blanks_credentials_the_log_door_blanks() {
+        use crate::job::job_from_json;
+        use crate::testutil::test_daemon;
+        let dir = std::env::temp_dir().join(format!("nzbfast-reportscrub-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = test_daemon(&dir);
+        *d.apikey.lock_ok() = Some("DAEMONAPIKEY0001".to_string());
+        let job = Arc::new(Mutex::new(
+            job_from_json(&json!({
+                "nzo_id": "SABnzbd_nzo_reportscrub",
+                "name": "0123abcd.nzb&i=42&r=SECRETRSSKEY0123456789",
+                "nzb_path": dir.join("x.nzb").to_string_lossy(),
+                "out_dir": dir.join("out").to_string_lossy(),
+                "state": "Failed",
+                "fail_message": "grab https://idx.example/getnzb/a.nzb?id=1&token=TOKSECRET99 \
+                                 with DAEMONAPIKEY0001 failed",
+            }))
+            .unwrap(),
+        ));
+        d.history.lock_ok().push(job);
+        let r = job_report(&d, "SABnzbd_nzo_reportscrub").expect("a report");
+        for leak in ["SECRETRSSKEY", "TOKSECRET99", "DAEMONAPIKEY0001"] {
+            assert!(!r.contains(leak), "{leak} in report:\n{r}");
+        }
+        // Not over-scrubbed: host, path and the guid survive.
+        assert!(r.contains("https://idx.example/getnzb/a.nzb?id=1&token=***"), "{r}");
+        assert!(r.contains("0123abcd.nzb&i=42&r=***"), "{r}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// The report is assembled to be pasted somewhere public, so the two
     /// things that travel with paths and log lines have to go.

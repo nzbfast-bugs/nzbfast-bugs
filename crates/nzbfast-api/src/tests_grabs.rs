@@ -2182,6 +2182,38 @@ fn name_from_fetch_strips_the_query() {
     assert_eq!(super::name_from_fetch(&f, "https://x/dir/"), None);
 }
 
+/// GHSA-v8ph-rq6w-3gp5: newznab grab links carry `&i=<uid>&r=<apikey>`
+/// in the PATH, no `?`. The key must not become the job name; a literal
+/// `&` that does not start a `name=` pair stays.
+#[test]
+fn name_from_fetch_drops_newznab_path_params() {
+    let f = super::Fetched {
+        bytes: Vec::new(),
+        failure_link: String::new(),
+        host: String::new(),
+        https: false,
+        category: String::new(),
+        filename: String::new(),
+        addrs: Vec::new(),
+    };
+    assert_eq!(
+        super::name_from_fetch(&f, "https://x/getnzb/0123abcd.nzb&i=42&r=SECRETKEY01").as_deref(),
+        Some("0123abcd.nzb")
+    );
+    assert_eq!(
+        super::name_from_fetch(&f, "https://x/getnzb/abc.nzb&apikey=K&x=1?y=2").as_deref(),
+        Some("abc.nzb")
+    );
+    assert_eq!(
+        super::name_from_fetch(&f, "https://x/Tom & Jerry.nzb").as_deref(),
+        Some("Tom & Jerry.nzb")
+    );
+    assert_eq!(
+        super::name_from_fetch(&f, "https://x/A&B.nzb").as_deref(),
+        Some("A&B.nzb")
+    );
+}
+
 /// SSRF guard: cloud-metadata / link-local is refused; loopback, LAN
 /// and CGNAT stay reachable (self-hosted indexers + Tailscale live
 /// there), as do public hosts.
