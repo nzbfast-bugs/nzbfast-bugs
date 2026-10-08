@@ -508,3 +508,47 @@ fn the_history_undo_store_does_not_survive_a_restart() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// BUG HUNT: a move redrive (auto-retry scheduler / "Try the move now")
+/// snapshots the history Arc, then raises `moving` without re-checking
+/// that the record is still in history (or tombstoned). A files-kept
+/// delete landing in that gap is not refused (no fence yet), and the
+/// redrive then moves the deleted record's payload anyway.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_redrive_does_not_move_a_record_deleted_before_its_fence() {
+    let dir = tmp("redrive-race");
+    let d = test_daemon(&dir);
+    let nas = dir.join("nas");
+    std::fs::create_dir_all(&nas).unwrap();
+    *d.move_completed.write_ok() = Some(nas.clone());
+    let job = filed(&d, "SABnzbd_nzo_rd", "Redrive.Release");
+    let src = job.lock_ok().out_dir.clone();
+    job.lock_ok().move_failed = "earlier: Permission denied".into();
+
+    let d2 = d.clone();
+    let delete_answer = Arc::new(std::sync::Mutex::new(None));
+    let da = delete_answer.clone();
+    *nzbfast_daemon::daemon::TEST_REDRIVE_PAUSE.lock().unwrap() = Some(Box::new(move || {
+        let j = hist_delete_arm(&d2, &params(&[("name", "delete")]), "SABnzbd_nzo_rd");
+        *da.lock().unwrap() = Some(j);
+    }));
+    let started = d.redrive_move("SABnzbd_nzo_rd");
+    let j = delete_answer.lock().unwrap().take().expect("hook ran");
+    assert_eq!(j["status"], serde_json::json!(true), "delete accepted: {j}");
+    assert!(d.history.lock_ok().is_empty());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while d.moving.lock_ok().contains("SABnzbd_nzo_rd") && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let moved_to = nas.join("Redrive.Release").join("a.bin");
+    assert!(
+        !started && src.join("a.bin").exists() && !moved_to.exists(),
+        "redrive started={started}: a deleted (files-kept) record's payload was moved \
+         from {} to {} (exists={}); record out_dir now {}",
+        src.display(),
+        moved_to.display(),
+        moved_to.exists(),
+        job.lock_ok().out_dir.display()
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
