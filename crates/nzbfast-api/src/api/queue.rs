@@ -367,17 +367,50 @@ fn m_change_cat(
     _ctx: &ApiCtx<'_>,
     _api_body: &mut Option<Vec<u8>>,
 ) -> Option<Value> {
-    Some({
-        let id = params.get("value").cloned().unwrap_or_default();
-        let cat = params.get("value2").cloned().unwrap_or_default();
-        let cat = cat.trim().trim_matches('*').trim().to_string();
-        // Untrusted: a single contained path component, the
-        // same guard as enqueue and the history form.
-        let cat = if cat.is_empty() {
-            cat
+    let value = params.get("value").cloned().unwrap_or_default();
+    let cat = params.get("value2").cloned().unwrap_or_default();
+    let cat = cat.trim().trim_matches('*').trim().to_string();
+    // Untrusted: a single contained path component, the
+    // same guard as enqueue and the history form.
+    let cat = if cat.is_empty() {
+        cat
+    } else {
+        nzbkit::disk::sanitize_filename(&cat)
+    };
+    // SAB parity (issue #327): `value` is a comma-separated list of
+    // nzo_ids, each recategorized on its own (queue or history). One id
+    // answers exactly what the single-id arm always answered.
+    let ids: Vec<&str> = value
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if ids.len() <= 1 {
+        return Some(change_cat_one(d, ids.first().copied().unwrap_or(""), &cat));
+    }
+    let mut changed: Vec<String> = Vec::new();
+    let mut failed: Vec<String> = Vec::new();
+    for id in ids {
+        let v = change_cat_one(d, id, &cat);
+        if v.get("status").and_then(Value::as_bool) == Some(true) {
+            changed.push(id.to_string());
         } else {
-            nzbkit::disk::sanitize_filename(&cat)
-        };
+            let e = v.get("error").and_then(Value::as_str).unwrap_or("refused");
+            failed.push(format!("{id}: {e}"));
+        }
+    }
+    let mut out = json!({"status": !changed.is_empty(), "nzo_ids": changed});
+    if !failed.is_empty() {
+        out["error"] = json!(failed.join("; "));
+    }
+    Some(out)
+}
+
+/// One id of [`m_change_cat`]: the queued form, else the history form.
+fn change_cat_one(d: &Arc<Daemon>, id: &str, cat: &str) -> Value {
+    let id = id.to_string();
+    let cat = cat.to_string();
+    {
         // Three phases, and they have to stay three: picking
         // the new directory goes through `dir_claim`, which
         // locks the queue itself, so computing it while
@@ -408,12 +441,10 @@ fn m_change_cat(
             // directory reads as taken and the name climbs .2.
             Some((_, _, current)) if current == cat => json!({"status": true}),
             Some((job, name, _)) => match requeue_category(d, &job, &name, &cat) {
-                Err(e) => {
-                    return Some(json!({
-                        "status": false,
-                        "error": e
-                    }));
-                }
+                Err(e) => json!({
+                    "status": false,
+                    "error": e
+                }),
                 // Saved with the fence still held, rolled back whole on
                 // a refused store (review C10) - the relocation fence
                 // prevents the live scheduling race, not a restart after
@@ -432,7 +463,7 @@ fn m_change_cat(
                 }
             },
         }
-    })
+    }
 }
 
 /// §282 item 12. `value` is the download that cannot finish, `alt` the
@@ -2249,3 +2280,6 @@ mod cancelundo_tests;
 
 #[cfg(test)]
 mod histundo_tests;
+
+#[cfg(test)]
+mod changecat_tests;
