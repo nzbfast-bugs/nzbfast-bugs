@@ -2945,3 +2945,20 @@ fn a_month_is_evidence_where_the_year_it_replaced_was() {
     assert!(!looks_like_release_name("Slam.TruePDF-September.2016.pdf"));
     assert!(!looks_like_release_name("Slam.TruePDF-September.2016"));
 }
+
+/// Scene music spelled with dots for spaces, carrying a format marker,
+/// is the same `Artist-Album-YEAR-FORMAT-GROUP` field shape as the
+/// underscore spelling and must read the same way.
+#[test]
+fn dotted_scene_music_with_a_format_marker_reads_artist_album_year() {
+    let u = p("Pink_Floyd-The_Wall-1979-FLAC-GRP");
+    assert_eq!(
+        (u.kind, u.title.as_str(), u.year),
+        (Kind::Music, "Pink Floyd - The Wall", Some(1979))
+    );
+    let d = p("Pink.Floyd-The.Wall-1979-FLAC-GRP");
+    assert_eq!(
+        (d.kind, d.title.as_str(), d.year),
+        (Kind::Music, "Pink Floyd - The Wall", Some(1979))
+    );
+}
