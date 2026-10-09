@@ -69,7 +69,12 @@ pub(super) fn cue_named_files(dir: &Path) -> HashSet<String> {
     };
     for entry in rd.flatten() {
         let p = entry.path();
-        if !p.is_file() || p.extension().is_none_or(|e| !e.eq_ignore_ascii_case("cue")) {
+        // `file_type` does not follow links: a symlinked "sheet" can point
+        // anywhere the daemon can read, and its size would be the LINK's
+        // (#355). Only a real file in the job is a cue sheet.
+        if !entry.file_type().is_ok_and(|t| t.is_file())
+            || p.extension().is_none_or(|e| !e.eq_ignore_ascii_case("cue"))
+        {
             continue;
         }
         if entry.metadata().map(|m| m.len()).unwrap_or(u64::MAX) > CUE_MAX {
@@ -77,10 +82,18 @@ pub(super) fn cue_named_files(dir: &Path) -> HashSet<String> {
         }
         // A cue sheet is CP1252 or UTF-8 depending on who wrote it, and
         // a byte that decodes to neither must not lose us the whole
-        // sheet - the FILE lines are ASCII either way.
-        let Ok(text) = std::fs::read(&p) else {
+        // sheet - the FILE lines are ASCII either way. Read through a
+        // bounded reader so a file that grows (or is swapped) between the
+        // size check and the read still cannot exceed the ceiling.
+        let mut text = Vec::new();
+        let Ok(f) = std::fs::File::open(&p) else {
             continue;
         };
+        if std::io::Read::read_to_end(&mut std::io::Read::take(f, CUE_MAX + 1), &mut text).is_err()
+            || text.len() as u64 > CUE_MAX
+        {
+            continue;
+        }
         for line in String::from_utf8_lossy(&text).lines() {
             if let Some(name) = cue_file_line(line) {
                 named.insert(name);
@@ -255,5 +268,37 @@ mod tests {
         assert!(!is_cue_set_member("cover.jpg", "jpg", &named));
         // A disc image the sheets do NOT name is not spared by this arm.
         assert!(!is_cue_set_member("Unrelated.bin", "bin", &named));
+    }
+
+    /// A symlinked `.cue` was sized by the LINK (`DirEntry::metadata` does
+    /// not follow on Unix) but read through to its target, so the
+    /// CUE_MAX ceiling did not bound the read (#355).
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_cue_over_the_ceiling_is_not_read() {
+        let base = std::env::temp_dir().join(format!("nzbfast-cuelink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let dir = base.join("job");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Outside the job, 64x over the ceiling (sparse), sheet text at the end.
+        let outside = base.join("outside.dat");
+        let f = std::fs::File::create(&outside).unwrap();
+        f.set_len(CUE_MAX * 64).unwrap();
+        drop(f);
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&outside)
+            .unwrap();
+        f.write_all(b"\nFILE \"Outside.bin\" BINARY\n").unwrap();
+        drop(f);
+        std::os::unix::fs::symlink(&outside, dir.join("Album.cue")).unwrap();
+        let named = cue_named_files(&dir);
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(
+            named.is_empty(),
+            "read {} MiB through a symlinked cue: {named:?}",
+            CUE_MAX * 64 >> 20
+        );
     }
 }
