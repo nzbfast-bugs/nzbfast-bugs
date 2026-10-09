@@ -635,6 +635,18 @@ fn unquoted_subject_filenames_are_recovered() {
     assert_eq!(p.kind(), FileKind::Par2Volume);
 }
 
+#[test]
+fn unquoted_subject_lowercase_yenc_and_bracket_counter() {
+    for (subject, want) in [
+        ("release.part01.rar yenc (1/2)", Some("release.part01.rar")),
+        ("release.part01.rar YENC (1/2)", Some("release.part01.rar")),
+        ("release.part01.rar [1/50]", Some("release.part01.rar")),
+        ("release.part01.rar yEnc [1/50]", Some("release.part01.rar")),
+    ] {
+        assert_eq!(unquoted_filename(subject), want, "subject: {subject:?}");
+    }
+}
+
 /// A hostile .nzb can name its volumes anything. `u64::MAX` parses,
 /// and used to be cast straight to `usize` and added into the
 /// pre-flight recovery budget - two such volumes overflowed the sum
