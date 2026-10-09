@@ -1012,6 +1012,8 @@ fn parse_rss_items(xml: &str) -> Vec<FeedItem> {
         let size = enclosure
             .and_then(|e| attr(e, "length"))
             .and_then(|v| v.parse().ok())
+            // `length="0"` is a placeholder, not a size.
+            .filter(|&n: &u64| n > 0)
             .or_else(|| {
                 // newznab: <newznab:attr name="size" value="123"/>
                 item.split("<newznab:attr").skip(1).find_map(|a| {
@@ -1098,6 +1100,7 @@ fn parse_atom_entries(xml: &str) -> Vec<FeedItem> {
         let size = download
             .and_then(|l| attr(l, "length"))
             .and_then(|v| v.parse().ok())
+            .filter(|&n: &u64| n > 0)
             .or_else(|| {
                 entry.split("<newznab:attr").skip(1).find_map(|a| {
                     let a = &a[..a.find('>').unwrap_or(a.len())];
@@ -1929,5 +1932,15 @@ mod tests {
         assert!(assign_feed_ids(&mut list), "a duplicate is work");
         assert_ne!(list[0].id, list[1].id);
         assert_eq!(list[0].id, ids[0], "the FIRST one keeps its id");
+    }
+
+    /// An enclosure `length="0"` says nothing about the size, so the
+    /// newznab size attr still counts - in both grammars.
+    #[test]
+    fn a_zero_enclosure_length_falls_back_to_the_newznab_size() {
+        let rss = r#"<rss><channel><item><title>A</title><enclosure url="http://x/a.nzb" length="0" type="application/x-nzb"/><newznab:attr name="size" value="5000"/></item></channel></rss>"#;
+        assert_eq!(parse_feed(rss)[0].size, 5000);
+        let atom = r#"<feed><entry><title>A</title><link rel="enclosure" href="http://x/a.nzb" length="0"/><newznab:attr name="size" value="5000"/></entry></feed>"#;
+        assert_eq!(parse_feed(atom)[0].size, 5000);
     }
 }
