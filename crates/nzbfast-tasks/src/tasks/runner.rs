@@ -392,6 +392,7 @@ pub(super) async fn download_guards(
         return None;
     }
     let mut only_force = d.paused.load(Ordering::Relaxed);
+    let mut quota_held = false;
     let quota = d.quota.load(Ordering::Relaxed);
     let period = d.quota_period.load(Ordering::Relaxed) as char;
     if quota > 0 || ledger.is_some() {
@@ -452,8 +453,12 @@ pub(super) async fn download_guards(
             fresh,
         );
         only_force = true;
+        quota_held = true;
     }
-    if guard_reason.is_some() && !only_force {
+    // Keyed on the guards themselves, not on `only_force`: a user pause
+    // also sets that, and must not keep a disk or quota hold on screen
+    // after the condition behind it has gone.
+    if guard_reason.is_some() && !quota_held {
         info!(target: "guard", "cleared");
         *guard_reason = None;
         d.note_event(

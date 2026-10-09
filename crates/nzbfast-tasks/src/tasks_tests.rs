@@ -1228,3 +1228,43 @@ fn a_job_shorter_than_a_watchdog_tick_still_banks_its_refusal() {
     );
     assert!(!r.permanent);
 }
+
+/// A low-disk hold taken while the queue is running must lift once the
+/// space is back, even if the user paused the queue in the meantime:
+/// the dashboard's banner is drawn from `queue_hold`, and a "disk" hold
+/// left there keeps reporting a full disk that is no longer full.
+#[tokio::test]
+async fn a_disk_hold_lifts_when_space_returns_while_paused() {
+    let dir = tdir("diskhold-paused");
+    let d = super::super::testutil::test_daemon(&dir);
+    let lane = PostprocLane::new(d.clone());
+    let config = dir.join("no-such-config.json");
+    let mut guard = None;
+    let mut ledger = None;
+    let mut probe = None;
+    let mut servers = super::runner::ServerProbe::default();
+    // Any real disk is under a floor of u64::MAX.
+    d.min_free.store(u64::MAX, Ordering::Relaxed);
+    let r = super::runner::download_guards(
+        &d, &config, &lane, &mut guard, &mut ledger, &mut probe, &mut servers, true,
+    )
+    .await;
+    assert!(r.is_none(), "the disk guard holds the queue");
+    assert_eq!(
+        d.queue_hold.lock_ok().as_ref().map(|(k, ..)| k.clone()).as_deref(),
+        Some("disk")
+    );
+    // The user pauses, then frees space (here: lowers the floor to off).
+    d.paused.store(true, Ordering::Relaxed);
+    d.min_free.store(0, Ordering::Relaxed);
+    let r = super::runner::download_guards(
+        &d, &config, &lane, &mut guard, &mut ledger, &mut probe, &mut servers, true,
+    )
+    .await;
+    assert_eq!(r, Some(true), "paused: only Force may run");
+    assert_eq!(
+        d.queue_hold.lock_ok().as_ref().map(|(k, ..)| k.clone()),
+        None,
+        "the disk is no longer low, so no disk hold may be published"
+    );
+}
