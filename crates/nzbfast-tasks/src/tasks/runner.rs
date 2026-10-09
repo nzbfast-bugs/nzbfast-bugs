@@ -210,8 +210,17 @@ pub(super) async fn download_guards(
     let mut free_now: Option<u64> = None;
     if min > 0 {
         let mut probe = disk_probe.take().unwrap_or_else(|| {
-            let out = crate::naming::out_dir(d);
-            tokio::task::spawn_blocking(move || free_bytes(&out))
+            // The download root, plus every queued write-through job's
+            // own directory: those write into their category's
+            // destination, often another volume, and a job parked off
+            // a full one (`park_on_full_disk`) relies on this hold.
+            let mut dirs = vec![crate::naming::out_dir(d)];
+            dirs.extend(d.queue.lock_ok().iter().filter_map(|j| {
+                let g = j.lock_ok();
+                (g.write_through && g.state == JobState::Queued && !g.paused)
+                    .then(|| g.out_dir.clone())
+            }));
+            tokio::task::spawn_blocking(move || dirs.iter().filter_map(|p| free_bytes(p)).min())
         });
         match tokio::time::timeout(std::time::Duration::from_secs(2), &mut probe).await {
             Ok(res) => free_now = res.ok().flatten(),
