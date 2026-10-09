@@ -1228,3 +1228,38 @@ fn a_job_shorter_than_a_watchdog_tick_still_banks_its_refusal() {
     );
     assert!(!r.permanent);
 }
+
+/// A write-through job downloads into its category's destination, which
+/// is routinely a different volume from the download root. When that
+/// volume is under the min-free floor the job is parked back in the
+/// queue on the promise that the runner's disk hold takes it from there
+/// (`park_on_full_disk`); the hold must therefore see that volume, or
+/// the parked job is simply picked again straight onto the full disk.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[tokio::test]
+async fn the_disk_hold_sees_a_full_write_through_volume() {
+    // A pseudo-filesystem that always reports zero bytes available
+    // stands in for the full destination volume.
+    let full = if cfg!(target_os = "macos") { "/dev" } else { "/proc" };
+    assert_eq!(free_bytes(std::path::Path::new(full)), Some(0));
+    let dir = tdir("diskhold-wt");
+    let d = super::super::testutil::test_daemon(&dir);
+    let mut j = mkjob("Some.Release", "");
+    j.write_through = true;
+    j.out_dir = std::path::Path::new(full).join("nzbfast-dest/Some.Release");
+    d.queue.lock_ok().push_back(Arc::new(Mutex::new(j)));
+    let lane = PostprocLane::new(d.clone());
+    let config = dir.join("no-such-config.json");
+    let (mut guard, mut ledger, mut probe) = (None, None, None);
+    let mut servers = super::runner::ServerProbe::default();
+    d.min_free.store(1, Ordering::Relaxed);
+    let r = super::runner::download_guards(
+        &d, &config, &lane, &mut guard, &mut ledger, &mut probe, &mut servers, true,
+    )
+    .await;
+    assert_eq!(
+        (r, d.queue_hold.lock_ok().as_ref().map(|(k, ..)| k.clone())),
+        (None, Some("disk".to_string())),
+        "the only queued job writes to a volume with 0 bytes free"
+    );
+}
