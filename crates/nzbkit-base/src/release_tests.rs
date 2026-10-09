@@ -614,6 +614,16 @@ fn multi_episode_markers() {
 }
 
 #[test]
+fn triple_episode_marker_covers_the_whole_run() {
+    let r = p("Show.Name.S01E01E02E03.720p.HDTV.x264-GRP");
+    assert_eq!((r.kind, r.season, r.episode, r.episode2), (Kind::Tv, Some(1), Some(1), Some(3)));
+    let r = p("Show.Name.S02E10-E11-E12.1080p.WEB-GRP");
+    assert_eq!((r.season, r.episode, r.episode2), (Some(2), Some(10), Some(12)));
+    // A run that stops climbing is not a range.
+    assert_eq!(p("Show.Name.S01E01E03E02.720p-GRP").episode2, None);
+}
+
+#[test]
 fn title_that_is_a_year() {
     let m = p("2012.2009.1080p.BluRay.x264-METiS");
     assert_eq!(m.title, "2012");
