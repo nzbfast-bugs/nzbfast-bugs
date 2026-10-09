@@ -458,6 +458,30 @@ mod tests {
         );
     }
 
+    /// A hash wearing a multi-part volume suffix is still a hash: the
+    /// posted name of a split archive or recovery volume must not lose
+    /// to it.
+    #[test]
+    fn a_hash_with_a_volume_suffix_does_not_take_a_named_slot() {
+        for (hint, yenc) in [
+            (
+                "Some.Film.2026.1080p-GRP.part01.rar",
+                "c238183c9ea852006dbc09ffa6a26e98.part01.rar",
+            ),
+            (
+                "Some.Film.2026.1080p-GRP.vol00+01.par2",
+                "c238183c9ea852006dbc09ffa6a26e98.vol00+01.par2",
+            ),
+            (
+                "Some.Film.2026.1080p-GRP.7z.001",
+                "c238183c9ea852006dbc09ffa6a26e98.7z.001",
+            ),
+        ] {
+            let s = slot(hint, true);
+            assert_eq!(s.write_name(yenc), hint, "yEnc name {yenc}");
+        }
+    }
+
     /// The ordinary honest post: both names are real, nothing is at
     /// stake, and the yEnc header keeps winning exactly as before.
     #[test]
