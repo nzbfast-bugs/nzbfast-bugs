@@ -87,7 +87,15 @@ pub struct Session {
 
 /// The live sessions, by id.
 #[derive(Default)]
-pub struct Sessions(pub Mutex<std::collections::HashMap<String, Session>>);
+///
+/// The second field is the sign-out epoch: bumped (under the map lock) by
+/// every [`Sessions::drop_all`], so a sign-in whose credential was read
+/// before a credential change can be refused by [`Sessions::create_since`]
+/// instead of minting a session from the revoked credential.
+pub struct Sessions(
+    pub Mutex<std::collections::HashMap<String, Session>>,
+    pub std::sync::atomic::AtomicU64,
+);
 
 /// What a presented cookie proved.
 pub enum SessionCheck {
@@ -107,11 +115,28 @@ pub enum SessionCheck {
 }
 
 impl Sessions {
+    /// The current sign-out epoch. Read it BEFORE reading the credential
+    /// a sign-in is checked against, and hand it to [`Self::create_since`].
+    pub fn epoch(&self) -> u64 {
+        let _map = self.0.lock_ok();
+        self.1.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Mint a session and return `(id, csrf)`.
     pub fn create(&self) -> Option<(String, String)> {
+        self.create_since(None)
+    }
+
+    /// Mint a session only if no [`Self::drop_all`] has run since `epoch`
+    /// was read. `None` when one has (or the RNG failed): the credential
+    /// the caller verified may already be revoked.
+    pub fn create_since(&self, epoch: Option<u64>) -> Option<(String, String)> {
         let id = crate::bootstrap::random_apikey()?;
         let csrf = crate::bootstrap::random_apikey()?;
         let mut map = self.0.lock_ok();
+        if epoch.is_some_and(|e| e != self.1.load(std::sync::atomic::Ordering::SeqCst)) {
+            return None;
+        }
         let now = Instant::now();
         map.retain(|_, s| s.expires > now);
         while map.len() >= SESSION_MAX {
@@ -189,7 +214,9 @@ impl Sessions {
     /// not revoked anything, which is the whole reason somebody changes
     /// one.
     pub fn drop_all(&self) {
-        self.0.lock_ok().clear();
+        let mut map = self.0.lock_ok();
+        self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        map.clear();
     }
 
     /// How many sessions are live right now (expired ones are not
