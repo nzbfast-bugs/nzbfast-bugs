@@ -2315,7 +2315,9 @@ pub fn verify_dir(dir: &std::path::Path) -> Result<DirVerify> {
     let fast_check = nzbkit::par2::fast_check_enabled();
 
     let cap = par2_scan_cap();
-    let (par2_bytes, skipped) = collect_par2_bytes(dir, cap)?;
+    let (par2_bytes, skipped) = anyhow::Context::with_context(collect_par2_bytes(dir, cap), || {
+        format!("reading {}", dir.display())
+    })?;
     if skipped > 0 {
         // Said out loud, because it is why the recovery-block count below
         // may understate what is actually on disk.
@@ -2492,6 +2494,23 @@ pub fn verify_dir(dir: &std::path::Path) -> Result<DirVerify> {
 #[cfg(test)]
 mod par2_scan_cap_tests {
     use super::*;
+
+    /// `nzbfast verify <dir>` on a directory that is not there must say
+    /// WHICH path it could not read - the bare OS error alone leaves a
+    /// script's log with nothing to act on.
+    #[test]
+    fn verify_dir_on_a_missing_directory_names_it() {
+        let dir = std::env::temp_dir().join(format!(
+            "nzbfast-verify-missing-{}/not-here",
+            std::process::id()
+        ));
+        let err = verify_dir(&dir).expect_err("a missing directory is an error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(&dir.display().to_string()),
+            "error does not name the directory: {msg}"
+        );
+    }
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("nzbfast-p2cap-{tag}-{}", std::process::id()));
