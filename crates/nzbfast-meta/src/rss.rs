@@ -458,9 +458,17 @@ pub(crate) fn parse_feed_date(s: &str) -> Option<i64> {
         None => match rest.rfind(['+', '-']) {
             Some(i) => {
                 let z = &rest[i + 1..];
-                let mut zp = z.split(':');
-                let zh: i64 = zp.next().filter(|v| !v.is_empty())?.parse().ok()?;
-                let zm: i64 = zp.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+                // Extended `hh:mm`, or basic `hhmm` / `hh` with no colon.
+                let (zh, zm) = match z.split_once(':') {
+                    Some((h, m)) => (h, m),
+                    None if z.len() == 4 => (&z[..2], &z[2..]),
+                    None => (z, ""),
+                };
+                if zh.is_empty() || !z.bytes().all(|b| b.is_ascii_digit() || b == b':') {
+                    return None;
+                }
+                let zh: i64 = zh.parse().ok()?;
+                let zm: i64 = if zm.is_empty() { 0 } else { zm.parse().ok()? };
                 if !(0..=23).contains(&zh) || !(0..=59).contains(&zm) {
                     return None;
                 }
@@ -1929,5 +1937,16 @@ mod tests {
         assert!(assign_feed_ids(&mut list), "a duplicate is work");
         assert_ne!(list[0].id, list[1].id);
         assert_eq!(list[0].id, ids[0], "the FIRST one keeps its id");
+    }
+
+    /// ISO 8601 basic-format offsets (`+0200`, no colon) are as legal as
+    /// the extended `+02:00` and must move the instant the same way.
+    #[test]
+    fn an_iso_offset_without_a_colon_is_read() {
+        const T: i64 = 1_783_004_645;
+        assert_eq!(parse_feed_date("2026-07-02T17:04:05+0200"), Some(T));
+        assert_eq!(parse_feed_date("2026-07-02T11:04:05-0400"), Some(T));
+        assert_eq!(parse_feed_date("2026-07-02T17:04:05+02"), Some(T));
+        assert_eq!(parse_feed_date("2026-07-02T17:04:05+2400"), None);
     }
 }
