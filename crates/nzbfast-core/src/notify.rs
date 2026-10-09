@@ -759,6 +759,30 @@ mod smtp {
         Ok(a)
     }
 
+    /// RFC 2047: a header value with non-ASCII text goes out as UTF-8
+    /// base64 encoded-words (each at most 75 chars, split on char
+    /// boundaries, folded onto continuation lines), so the header block
+    /// stays 7-bit for a relay that offers neither SMTPUTF8 nor 8BITMIME.
+    pub(super) fn encode_header(v: &str) -> String {
+        if v.is_ascii() {
+            return v.to_string();
+        }
+        // 45 raw bytes -> 60 base64 chars + 12 of framing = 72.
+        let mut words = Vec::new();
+        let mut chunk = String::new();
+        for ch in v.chars() {
+            if chunk.len() + ch.len_utf8() > 45 {
+                words.push(format!("=?UTF-8?B?{}?=", b64(chunk.as_bytes())));
+                chunk.clear();
+            }
+            chunk.push(ch);
+        }
+        if !chunk.is_empty() {
+            words.push(format!("=?UTF-8?B?{}?=", b64(chunk.as_bytes())));
+        }
+        words.join("\r\n ")
+    }
+
     pub(super) fn send_email(t: &Target, cx: &Ctx) -> Result<u16, String> {
         let url = t.url.trim().trim_end_matches('/');
         let (tls_first, rest) = if let Some(r) = url.strip_prefix("smtps://") {
@@ -895,6 +919,7 @@ mod smtp {
             .map(|ch| if ch.is_control() { ' ' } else { ch })
             .take(200)
             .collect();
+        let subject = encode_header(&subject);
         // CRLF line endings and dot-stuffing, per RFC 5321.
         let text = preset_text(t, cx);
         let mut body = String::new();
@@ -1048,6 +1073,74 @@ mod tests {
     /// and address validation, and the cleartext-login refusal path is
     /// covered by the scheme check (smtp:// + token + no STARTTLS needs
     /// a server; the pure checks live here).
+    /// A minimal plain SMTP relay on loopback (no STARTTLS, no AUTH):
+    /// answers every command and hands back the DATA payload.
+    fn smtp_capture() -> (String, std::sync::mpsc::Receiver<String>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("smtp://{}", listener.local_addr().unwrap());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader, Write};
+            let Ok((sock, _)) = listener.accept() else {
+                return;
+            };
+            sock.set_read_timeout(Some(Duration::from_secs(5))).ok();
+            let mut w = sock.try_clone().unwrap();
+            let mut r = BufReader::new(sock);
+            let _ = w.write_all(b"220 test ESMTP\r\n");
+            let mut data = String::new();
+            let mut in_data = false;
+            loop {
+                let mut line = String::new();
+                if r.read_line(&mut line).unwrap_or(0) == 0 {
+                    break;
+                }
+                if in_data {
+                    if line == ".\r\n" {
+                        in_data = false;
+                        let _ = w.write_all(b"250 queued\r\n");
+                        let _ = tx.send(std::mem::take(&mut data));
+                    } else {
+                        data.push_str(&line);
+                    }
+                    continue;
+                }
+                let up = line.to_ascii_uppercase();
+                if up.starts_with("EHLO") {
+                    let _ = w.write_all(b"250 test\r\n");
+                } else if up.starts_with("DATA") {
+                    in_data = true;
+                    let _ = w.write_all(b"354 go\r\n");
+                } else if up.starts_with("QUIT") {
+                    let _ = w.write_all(b"221 bye\r\n");
+                    break;
+                } else {
+                    let _ = w.write_all(b"250 ok\r\n");
+                }
+            }
+        });
+        (url, rx)
+    }
+
+    #[test]
+    fn email_headers_stay_ascii_for_a_non_ascii_release_name() {
+        // The relay advertises neither SMTPUTF8 nor 8BITMIME, so the
+        // message header block must be 7-bit (RFC 5322 / RFC 2047).
+        let (url, rx) = smtp_capture();
+        let mut t = target(Kind::Email);
+        t.url = url;
+        t.email_to = "me@example.com".into();
+        let mut c = cx();
+        c.name = "Amélie.2001.Ünïcode".into();
+        send(&t, &c).expect("delivered");
+        let msg = rx.recv_timeout(Duration::from_secs(5)).expect("DATA seen");
+        let head = msg.split("\r\n\r\n").next().unwrap();
+        assert!(
+            head.is_ascii(),
+            "raw 8-bit bytes in the message headers:\n{head}"
+        );
+    }
+
     #[test]
     fn email_validation() {
         let mut t = target(Kind::Email);
