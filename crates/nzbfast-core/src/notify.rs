@@ -627,6 +627,9 @@ fn send(t: &Target, cx: &Ctx) -> Result<u16, String> {
         Kind::Email => unreachable!("email returns before the scheme gate"),
     };
     match resp {
+        // Redirects are off, so a 3xx (or any other non-2xx that is not
+        // an error class) means the notification was never delivered.
+        Ok(r) if !r.status().is_success() => Err(format!("HTTP {}", r.status().as_u16())),
         Ok(r) => Ok(r.status().as_u16()),
         // A 2xx-shaped failure still carries a status worth reporting;
         // anything else (DNS, refused, timeout) only has a message.
@@ -1422,6 +1425,25 @@ mod tests {
         assert_eq!(out[0].1.error, "", "a 2xx is not a failure");
         assert_eq!(out[0].1.at, 1_700_000_000);
         assert!(!out[0].1.test, "a fire is a real delivery, not a test");
+    }
+
+    #[test]
+    fn a_redirect_is_not_recorded_as_a_delivery() {
+        // Redirects are off, so a 302 means the notification went
+        // nowhere: the hop that would have delivered it was never made.
+        let (url, rx) = capture_answering("302 Found\r\nLocation: http://127.0.0.1:1/x", "");
+        let mut t = target(Kind::Webhook);
+        t.url = url;
+        let out = fire(&[t], &cx(), 42);
+        recv(&rx);
+        assert_eq!(out.len(), 1);
+        let o = &out[0].1;
+        assert!(
+            !o.error.is_empty(),
+            "a 302 must not read as a successful delivery (code {}, error {:?})",
+            o.code,
+            o.error
+        );
     }
 
     #[test]
