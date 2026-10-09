@@ -98,7 +98,17 @@ fn damage(dir: &Path, name: &str) {
     let mut b = std::fs::read(&p).expect("read back");
     let at = b.len() / 2;
     b[at] ^= 0x40;
+    // Bit rot does not touch a file's mtime, and a heal reads a NEWER
+    // mtime as the user's own edit (#365) - so the rot keeps it.
+    let was = std::fs::metadata(&p)
+        .and_then(|m| m.modified())
+        .expect("mtime");
     std::fs::write(&p, b).expect("damage");
+    std::fs::File::options()
+        .write(true)
+        .open(&p)
+        .and_then(|f| f.set_modified(was))
+        .expect("keep mtime");
 }
 
 const EP1: &str = "Show.S01E01.1080p.WEB-DL.x264-GRP";

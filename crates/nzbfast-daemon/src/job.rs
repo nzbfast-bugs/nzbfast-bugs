@@ -1668,8 +1668,10 @@ pub(super) async fn finalize_completed_gen(
             // derive a relative path for a payload that is not under
             // the download root, and would relocate it into a folder
             // beneath itself.
-            j.move_pending =
-                !needs_pw && !j.write_through && d.move_destination_configured(&j.category);
+            j.move_pending = !needs_pw
+                && !j.write_through
+                && j.heal_dir.as_os_str().is_empty()
+                && d.move_destination_configured(&j.category);
             // Recorded even when it changed no filename: an IMDb id with
             // no better name is still the thing that lets the history
             // row link to what it actually is.
