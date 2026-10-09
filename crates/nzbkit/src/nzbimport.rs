@@ -88,6 +88,8 @@ pub async fn fetch_posted_nzb(
     let mut out: Vec<u8> = Vec::new();
     // (offset, len) of every placed part, for the hole check.
     let mut placed: Vec<(u64, u64)> = Vec::with_capacity(segs.len());
+    // The declared total, which every part must agree on.
+    let mut declared: Option<u64> = None;
     for (_, mid) in segs {
         let body = conn
             .body(mid)
@@ -100,6 +102,11 @@ pub async fn fetch_posted_nzb(
             || dec.offset().saturating_add(dec.data.len() as u64) > MAX_POSTED_NZB
         {
             return Err(NzbImportError::TooBig);
+        }
+        match declared {
+            None => declared = Some(dec.file_size),
+            Some(d) if d != dec.file_size => return Err(NzbImportError::Holes),
+            Some(_) => {}
         }
         let off = dec.offset() as usize;
         let end = off + dec.data.len();
@@ -123,7 +130,7 @@ pub async fn fetch_posted_nzb(
         }
         cursor = off + len;
     }
-    if cursor != out.len() as u64 {
+    if cursor != out.len() as u64 || declared.is_some_and(|d| d != cursor) {
         return Err(NzbImportError::Holes);
     }
     // Gzip sniff: 0x1f 0x8b. Inflate under the same ceiling -
@@ -383,5 +390,28 @@ mod tests {
             .unwrap();
         assert_eq!(out, xml);
         assert!(nzb_identity(&out).is_ok());
+    }
+
+    #[tokio::test]
+    async fn posted_nzb_missing_final_part_is_not_success() {
+        use crate::mock::{Chaos, MockServer, make_file_articles};
+        let data: Vec<u8> = (0..3000u32).map(|i| b'a' + (i % 26) as u8).collect();
+        let mut arts = std::collections::HashMap::new();
+        let segs = make_file_articles("posted.nzb", &data, 1000, "pn", &mut arts);
+        assert_eq!(segs.len(), 3);
+        let srv = MockServer::start(arts, Chaos::default()).await;
+        let (mut conn, _) = Connection::connect(&srv.server_config()).await.unwrap();
+        // Only parts 1 and 2 are listed: the final part never arrives.
+        let ids: Vec<(u32, String)> = segs[..2]
+            .iter()
+            .map(|(id, _, n)| (*n, format!("<{id}>")))
+            .collect();
+        let r = fetch_posted_nzb(&mut conn, &ids).await;
+        assert!(
+            r.is_err(),
+            "declared size {} but got Ok with {} bytes",
+            data.len(),
+            r.as_ref().map(|v| v.len()).unwrap_or(0)
+        );
     }
 }
