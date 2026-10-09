@@ -704,3 +704,59 @@ fn a_heal_whose_recorded_post_is_gone_re_fetches_the_release_by_search() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// #370. An intact file the user renamed inside the library is not
+/// damage: verify finds it under its new name and heal plans nothing.
+#[test]
+fn a_user_renamed_intact_file_is_not_planned_for_heal() {
+    let dir = tdir("ren-ok");
+    settle(&dir, EP1, "sha-ep1", &[("Show - S01E01.mkv", body(20_000, 1))], false);
+    std::fs::rename(dir.join("Show - S01E01.mkv"), dir.join("Show - S01E01 - Pilot.mkv")).unwrap();
+    let r = Manifest::load(&dir).unwrap().verify(&dir).unwrap();
+    assert_eq!(
+        r.files,
+        vec![(
+            "Show - S01E01.mkv".to_string(),
+            FileStatus::Renamed { to: "Show - S01E01 - Pilot.mkv".to_string() }
+        )]
+    );
+    let p = plan(&dir).expect("plan");
+    assert!(p.is_empty(), "intact renamed file planned for re-download: {p:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// #370 control: a renamed file that is ALSO damaged is not accepted
+/// as intact - it is reported damaged and healed.
+#[test]
+fn a_renamed_damaged_file_is_still_damage() {
+    let dir = tdir("ren-bad");
+    settle(&dir, EP1, "sha-ep1", &[("Show - S01E01.mkv", body(20_000, 1))], false);
+    // Damage PAST the first 16 KiB, so the head hash still identifies
+    // the renamed file and only the full check can tell it is broken.
+    let p = dir.join("Show - S01E01.mkv");
+    let mut b = std::fs::read(&p).unwrap();
+    b[19_000] ^= 0x40;
+    std::fs::write(&p, b).unwrap();
+    std::fs::rename(&p, dir.join("Show - S01E01 - Pilot.mkv")).unwrap();
+    let r = Manifest::load(&dir).unwrap().verify(&dir).unwrap();
+    assert!(matches!(r.files[0].1, FileStatus::Damaged { .. }), "{:?}", r.files);
+    let p = plan(&dir).expect("plan");
+    assert_eq!(p.targets.len(), 1, "{p:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// #370 control: a file that is really gone - nothing of its length
+/// and content anywhere, only an unrelated new file - stays `Missing`.
+#[test]
+fn a_truly_missing_file_is_still_missing() {
+    let dir = tdir("ren-gone");
+    settle(&dir, EP1, "sha-ep1", &[("Show - S01E01.mkv", body(20_000, 1))], false);
+    std::fs::remove_file(dir.join("Show - S01E01.mkv")).unwrap();
+    // Same length, different bytes: not the file.
+    std::fs::write(dir.join("Other.mkv"), body(20_000, 9)).unwrap();
+    let r = Manifest::load(&dir).unwrap().verify(&dir).unwrap();
+    assert_eq!(r.files[0].1, FileStatus::Missing, "{:?}", r.files);
+    let p = plan(&dir).expect("plan");
+    assert_eq!(p.targets.len(), 1, "{p:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
