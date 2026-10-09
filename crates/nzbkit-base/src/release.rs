@@ -158,14 +158,29 @@ fn tv_marker(tok: &str) -> Option<(u32, Option<u32>, Option<u32>)> {
                 // there ("s01e01-720p" is quality furniture, not E720).
                 // Only a HIGHER number counts - "E05-E03" is a typo, not
                 // a range.
-                let tail = &ep[ed.len()..];
-                let tail = tail.strip_prefix('-').unwrap_or(tail);
-                let tail = tail.strip_prefix('e').unwrap_or(tail);
-                let e2 = ((2..=3).contains(&tail.len())
-                    && tail.bytes().all(|c| c.is_ascii_digit()))
-                .then(|| tail.parse::<u32>().ok())
-                .flatten()
-                .filter(|&e2| e2 > e1);
+                // Longer runs chain the same way ("e01e02e03",
+                // "e10-e11-e12"); each number must climb, and the LAST
+                // one ends the covered range.
+                let mut tail = &ep[ed.len()..];
+                let mut last = e1;
+                let mut e2 = None;
+                while !tail.is_empty() {
+                    let t = tail.strip_prefix('-').unwrap_or(tail);
+                    let t = t.strip_prefix('e').unwrap_or(t);
+                    let nd = t.bytes().take_while(u8::is_ascii_digit).count();
+                    let n = (2..=3)
+                        .contains(&nd)
+                        .then(|| t[..nd].parse::<u32>().ok())
+                        .flatten()
+                        .filter(|&n| n > last);
+                    let Some(n) = n else {
+                        e2 = None;
+                        break;
+                    };
+                    last = n;
+                    e2 = Some(n);
+                    tail = &t[nd..];
+                }
                 return Some((season, Some(e1), e2));
             }
         }
