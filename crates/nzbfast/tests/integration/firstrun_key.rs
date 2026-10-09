@@ -1128,3 +1128,20 @@ fn lan_ip() -> Option<std::net::Ipv4Addr> {
         _ => None,
     }
 }
+
+/// A settings.json that parses as JSON but is not an object (`null`,
+/// an array, a bare string) loads as an empty map exactly like an
+/// unreadable one, so a key that lived there is just as gone.
+#[test]
+fn a_non_object_settings_store_refuses_to_start_when_the_key_lived_there() {
+    for (i, body) in ["null", "[]", "\"dashboard-set-key\""].iter().enumerate() {
+        let dir = scratch(&format!("settings-non-object-fails-closed-{i}"));
+        std::fs::create_dir_all(dir.join(".spool")).unwrap();
+        std::fs::write(dir.join("settings.json"), body).unwrap();
+        let log = expect_refusal(&dir, free_port(), &["--bind", "127.0.0.1"]);
+        assert!(
+            log.contains("refusing to start the control API"),
+            "{body}: {log}"
+        );
+    }
+}

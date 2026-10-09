@@ -131,11 +131,15 @@ fn write_atomic_sync(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// settings, dangerous for a credential, so the caller can ask.
 pub fn json_store_unreadable(path: &Path) -> bool {
     let bak = sibling(path, ".bak");
+    // Every store this guards is a JSON OBJECT (settings.json). Valid
+    // JSON of any other shape - `null`, an array, a bare string - loads
+    // as an empty map exactly like a torn file does, so it is just as
+    // unreadable for the question callers ask.
     let readable = |p: &Path| {
         std::fs::read(p)
             .ok()
             .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
-            .is_some()
+            .is_some_and(|v| v.is_object())
     };
     // `.corrupt` counts as evidence the primary once existed: an
     // unparseable primary is RENAMED there, so by the next start the
