@@ -1207,7 +1207,15 @@ pub fn parse_rfc2822(s: &str) -> Option<i64> {
                 0
             }
         }
-        _ => 0, // GMT/UT/UTC/Z and unknown names
+        // RFC 2822 section 4.3's obsolete-but-defined US zone names.
+        z => match z.to_ascii_uppercase().as_str() {
+            "EDT" => -4 * 3600,
+            "EST" | "CDT" => -5 * 3600,
+            "CST" | "MDT" => -6 * 3600,
+            "MST" | "PDT" => -7 * 3600,
+            "PST" => -8 * 3600,
+            _ => 0, // GMT/UT/UTC/Z and unknown names
+        },
     };
     Some(days_from_civil(year, mon, day) * 86_400 + h * 3600 + mi * 60 + sec - off)
 }
@@ -1929,5 +1937,16 @@ mod tests {
         assert!(assign_feed_ids(&mut list), "a duplicate is work");
         assert_ne!(list[0].id, list[1].id);
         assert_eq!(list[0].id, ids[0], "the FIRST one keeps its id");
+    }
+
+    /// RFC 2822 section 4.3's named US zones are offsets, not UTC.
+    #[test]
+    fn an_rfc2822_named_zone_moves_the_instant() {
+        const T: i64 = 1_783_004_645;
+        assert_eq!(parse_feed_date("Thu, 02 Jul 2026 11:04:05 EDT"), Some(T));
+        assert_eq!(parse_feed_date("Thu, 02 Jul 2026 10:04:05 EST"), Some(T));
+        assert_eq!(parse_feed_date("Thu, 02 Jul 2026 08:04:05 PDT"), Some(T));
+        assert_eq!(parse_feed_date("Thu, 02 Jul 2026 07:04:05 pst"), Some(T));
+        assert_eq!(parse_feed_date("Thu, 02 Jul 2026 15:04:05 GMT"), Some(T));
     }
 }
