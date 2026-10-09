@@ -46,7 +46,15 @@ pub fn collect_par2_bytes(dir: &std::path::Path, total_cap: u64) -> Result<(Vec<
 
     let mut paths: Vec<PathBuf> = Vec::new();
     for entry in std::fs::read_dir(dir)? {
-        let path = entry?.path();
+        let entry = entry?;
+        // Regular files only, judged from the entry itself (no link
+        // follow): a FIFO named `*.par2` would block the open forever,
+        // and a directory or socket under that name would fail the read
+        // and, through `?`, discard the whole scan (issue #361).
+        if !entry.file_type().is_ok_and(|t| t.is_file()) {
+            continue;
+        }
+        let path = entry.path();
         // By name OR by the `PAR2\0PKT` packet magic. An obfuscated post
         // ships its index and recovery volumes as extensionless hashes,
         // and taking only the name meant this reported "no .par2 files"
@@ -78,9 +86,44 @@ pub fn collect_par2_bytes(dir: &std::path::Path, total_cap: u64) -> Result<(Vec<
             skipped += 1;
             continue;
         }
-        let data = std::fs::read(&path)?;
+        // One bad file costs that file, not the scan: an unreadable
+        // volume (permissions, I/O error, swapped for a special file
+        // since the listing) is named in a warning and skipped.
+        let data = match read_regular(&path) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(
+                    target: "par2",
+                    file = %path.display(),
+                    "skipping unreadable PAR2 candidate: {e}"
+                );
+                continue;
+            }
+        };
         held += data.len() as u64;
         par2_bytes.push(data);
     }
     Ok((par2_bytes, skipped))
+}
+
+/// Read `path` whole, refusing anything that is not a regular file once
+/// opened. The open is non-blocking on Unix so an entry swapped for a
+/// FIFO after the listing cannot park the caller waiting for a writer.
+fn read_regular(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    }
+    let mut f = opts.open(path)?;
+    let meta = f.metadata()?;
+    if !meta.is_file() {
+        return Err(std::io::Error::other("not a regular file"));
+    }
+    let mut data = Vec::with_capacity(meta.len().try_into().unwrap_or(0));
+    f.read_to_end(&mut data)?;
+    Ok(data)
 }
