@@ -1934,6 +1934,33 @@ pub fn norm_title(t: &str) -> String {
         .join(" ")
 }
 
+/// Is the tag-spelled token at `i` really a TITLE word? Only for the
+/// furniture tags that are also ordinary words or initials ("Web" in
+/// "Charlotte's.Web.2006", "H" in "M.A.S.H.1970"), and only when a
+/// movie year still follows with nothing but plain words in between -
+/// scene names put every piece of furniture AFTER the year, so a tag
+/// spelling in front of one is part of the name. `H` followed by its
+/// codec digits ("H.264") stays furniture.
+fn title_word_before_year(toks: &[&str], i: usize) -> bool {
+    let lw = toks[i].to_ascii_lowercase();
+    if !matches!(lw.as_str(), "web" | "h" | "dl" | "ts" | "ma") {
+        return false;
+    }
+    for t in &toks[i + 1..] {
+        if is_year(t) {
+            return true;
+        }
+        if is_tag(t)
+            || res_of(t).is_some()
+            || tv_marker(t).is_some()
+            || t.chars().all(|c| c.is_ascii_digit())
+        {
+            return false;
+        }
+    }
+    false
+}
+
 /// Parse one release name into the facts it carries.
 ///
 /// Pure text in, structured facts out: no lookups, no I/O, and no
@@ -2227,7 +2254,7 @@ fn parse_one(stem: &str, dashed_ep: bool) -> Parsed {
                 episode.get_or_insert(e);
             }
             boundary = boundary.min(i);
-        } else if i > 0 && is_tag(t) {
+        } else if i > 0 && is_tag(t) && !title_word_before_year(&toks, i) {
             // Never at index 0: a tag there would leave NO title, and a
             // stem with no title is filed `Other` with junk 100 - which
             // is what happened to every "Max <Author> - <Book>.epub" in
