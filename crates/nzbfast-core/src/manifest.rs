@@ -193,6 +193,13 @@ pub enum FileStatus {
     PresentUnverified,
     /// A source entry the tail consumed - informational, never damage.
     SourceGone,
+    /// Present at the recorded size but could not be read (permissions,
+    /// an I/O error mid-stream). Not damage - a heal must not re-download
+    /// it - but not verified either, so [`VerifyReport::all_ok`] fails on
+    /// it: "could not check" is never reported as "clean".
+    Unreadable {
+        error: String,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -632,7 +639,14 @@ impl Manifest {
                 Ok(_) if e.md5.is_none() && e.crc32s.is_empty() => FileStatus::PresentUnverified,
                 // The entry's OWN stride, never the manifest's: a shared
                 // season folder carries grids from several PAR2 sets.
-                Ok(_) => check_entry(e, e.bs, &path)?,
+                // A read failure is this entry's verdict, not the whole
+                // report's: one unreadable file must not hide every
+                // other file's status.
+                Ok(_) => check_entry(e, e.bs, &path).unwrap_or_else(|err| {
+                    FileStatus::Unreadable {
+                        error: err.to_string(),
+                    }
+                }),
             };
             report.files.push((e.name.clone(), status));
         }
@@ -739,7 +753,23 @@ fn walk_files(dir: &Path) -> std::io::Result<Vec<(String, u64, PathBuf)>> {
     let mut out = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
-        for ent in std::fs::read_dir(&d)?.flatten() {
+        // Only the ROOT may fail the walk. A subdirectory we cannot list
+        // (mode 000, another owner's `Extras/`) is skipped like an
+        // unstat-able entry below: propagating it meant no manifest was
+        // written and no verify reported anything (issue #363).
+        let rd = match std::fs::read_dir(&d) {
+            Ok(rd) => rd,
+            Err(e) if d.as_path() != dir => {
+                tracing::warn!(
+                    target: "par2",
+                    "manifest walk: skipping unreadable directory {}: {e}",
+                    d.display()
+                );
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        for ent in rd.flatten() {
             let name = ent.file_name().to_string_lossy().to_string();
             if name.starts_with(".nzbfast") {
                 continue;
@@ -1102,6 +1132,9 @@ pub fn verify_cli(dir: &Path) -> std::io::Result<bool> {
                 }
             }
             FileStatus::Missing => warn!(target: "par2", "✘ {name} - file missing"),
+            FileStatus::Unreadable { error } => {
+                warn!(target: "par2", "✘ {name} - could not be read: {error}");
+            }
             FileStatus::SizeMismatch { found } => {
                 warn!(target: "par2", "✘ {name} - size changed (now {found} bytes)");
             }
@@ -1962,6 +1995,121 @@ mod tests {
             FileStatus::SizeMismatch { found: 9000 }
         ));
         assert_eq!(report.extras, vec!["later-addition.srt".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod special_file_probe {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn tdir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("nzbfast-mf-probe-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn one_file_manifest(dir: &Path) -> Manifest {
+        let data = vec![7u8; 3000];
+        std::fs::write(dir.join("a.bin"), &data).unwrap();
+        let mut h = Md5::new();
+        h.update(&data);
+        let md5: [u8; 16] = h.finalize().into();
+        let set = nzbkit::par2::Par2Set {
+            comment: None,
+            recovery_set_id: [0u8; 16],
+            block_size: 4096,
+            files: vec![nzbkit::par2::Par2File {
+                file_id: [0u8; 16],
+                name: "a.bin".into(),
+                length: 3000,
+                md5,
+                md5_16k: md5,
+                blocks: vec![],
+            }],
+            nonrecovery: Vec::new(),
+            recovery_blocks_seen: 0,
+        };
+        Manifest::from_set(&set, "Job", "sha", false)
+    }
+
+    /// Running as root ignores mode 000, so these tests would prove nothing.
+    fn is_root() -> bool {
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    /// Issue #363: one unlistable subfolder no longer stops the manifest
+    /// being written; the readable payload beside it is still recorded.
+    #[test]
+    fn an_unreadable_subdir_does_not_stop_the_manifest_write() {
+        if is_root() {
+            return;
+        }
+        let dir = tdir("w");
+        let mut m = one_file_manifest(&dir);
+        let sub = dir.join("Extras");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let r = m.write_reconciled(&dir);
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        r.expect("write_reconciled must skip the unreadable subdir");
+        let back = Manifest::load(&dir).expect("manifest written");
+        assert!(back.files.iter().any(|e| e.name == "a.bin"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #363, verify side: the report still comes back and the
+    /// intact payload still verifies clean.
+    #[test]
+    fn an_unreadable_subdir_does_not_stop_the_verify() {
+        if is_root() {
+            return;
+        }
+        let dir = tdir("v");
+        let mut m = one_file_manifest(&dir);
+        m.write_reconciled(&dir).unwrap();
+        let sub = dir.join("Extras");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let r = Manifest::load(&dir).unwrap().verify(&dir);
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let report = r.expect("verify must return a report");
+        assert_eq!(report.files.len(), 1);
+        assert_eq!(report.files[0].0, "a.bin");
+        assert_eq!(report.files[0].1, FileStatus::Ok);
+        assert!(report.all_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #363: an unreadable listed file is that entry's verdict -
+    /// `Unreadable`, never Ok - and the rest of the report (here the
+    /// extras pass) still completes. `all_ok` is false, so
+    /// `nzbfast verify` exits non-zero.
+    #[test]
+    fn an_unreadable_entry_is_reported_not_fatal() {
+        if is_root() {
+            return;
+        }
+        let dir = tdir("u");
+        let mut m = one_file_manifest(&dir);
+        m.write_reconciled(&dir).unwrap();
+        std::fs::write(dir.join("later.srt"), b"x").unwrap();
+        let p = dir.join("a.bin");
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let r = Manifest::load(&dir).unwrap().verify(&dir);
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let report = r.expect("verify must return a report");
+        assert_eq!(report.files.len(), 1);
+        assert!(
+            matches!(report.files[0].1, FileStatus::Unreadable { .. }),
+            "{:?}",
+            report.files[0].1
+        );
+        assert_eq!(report.extras, vec!["later.srt".to_string()]);
+        assert!(!report.all_ok(), "an unchecked file is not a clean verify");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
