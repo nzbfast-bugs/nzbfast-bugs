@@ -704,3 +704,31 @@ fn a_heal_whose_recorded_post_is_gone_re_fetches_the_release_by_search() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// #369. Deleting a TV-filed episode with files must take its entries
+/// out of the shared season folder's manifest: left there, verify calls
+/// the deliberate delete `Missing` and heal offers to download it back.
+/// The sibling episode's entry, and its grid, must survive.
+#[test]
+fn a_deleted_filed_episode_leaves_the_season_manifest() {
+    let dir = tdir("del-filed").join("Season 01");
+    std::fs::create_dir_all(&dir).unwrap();
+    settle(&dir, EP1, "sha-ep1", &[("Show - S01E01.mkv", body(20_000, 1))], false);
+    settle(&dir, EP2, "sha-ep2", &[("Show - S01E02.mkv", body(20_000, 2))], false);
+    let tail = crate::smart::FiledTail { title: String::new(), suffix: String::new() };
+    let gone = crate::job::remove_job_files(&dir, EP1, true, &tail);
+    assert!(matches!(gone, crate::job::FilesGone::Yes(_)));
+    assert!(!dir.join("Show - S01E01.mkv").exists(), "episode 1 deleted");
+    let p = plan(&dir).expect("plan");
+    assert!(p.is_empty(), "a user-deleted episode is not damage: {p:?}");
+    let m = Manifest::load(&dir).expect("manifest still readable");
+    assert!(!m.files.iter().any(|e| e.name == "Show - S01E01.mkv"));
+    let ep2 = m.files.iter().find(|e| e.name == "Show - S01E02.mkv").expect("sibling kept");
+    assert_eq!(ep2.nzb_sha, "sha-ep2");
+    // The sibling is still policed: damage it and it is convicted.
+    damage(&dir, "Show - S01E02.mkv");
+    let p = plan(&dir).expect("plan");
+    assert_eq!(p.targets.len(), 1, "{p:?}");
+    assert_eq!(p.targets[0].nzb_sha, "sha-ep2");
+    let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+}

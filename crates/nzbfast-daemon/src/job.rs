@@ -2516,6 +2516,13 @@ pub fn remove_job_files(
             d.removed,
             out_dir.display()
         );
+        // The removed files leave the season folder's settle manifest
+        // too, or verify calls a deliberate delete `Missing` and heal
+        // offers to download it again (#369). Best-effort, like the
+        // manifest write itself.
+        if let Err(e) = crate::manifest::Manifest::forget(out_dir, &d.removed_names) {
+            warn!(target: "files", "{name}: settle manifest not updated after delete: {e}");
+        }
         // A refusal here leaves the episode sitting in the user's own
         // library, which is the half of this they are most likely to
         // find later and least likely to explain. Removing nothing at
