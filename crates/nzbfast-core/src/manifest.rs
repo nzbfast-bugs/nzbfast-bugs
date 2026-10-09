@@ -388,8 +388,7 @@ impl Manifest {
         // and re-walking it inside, which is a second answer to "what is
         // on disk" and exactly the read-modify-write race the lock is
         // here to prevent.
-        static WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _serialized = WRITE.lock_ok();
+        let _serialized = MANIFEST_WRITE.lock_ok();
         let mut unclaimed: Vec<(String, u64, PathBuf)> = walk_files(dir)?;
         // A manifest already here was written by an earlier job into the
         // same (shared) directory. Unreadable or of an unknown version is
@@ -483,6 +482,29 @@ impl Manifest {
             });
         }
         self.write_to(dir)
+    }
+
+    /// Drop the entries for `names` - files a delete-with-files just
+    /// removed on purpose - from `dir`'s manifest, so the folder does not
+    /// report them `Missing` and heal does not offer them back. Under the
+    /// same lock as `write_reconciled` (read-modify-write) and written
+    /// with the same temp-and-rename. No manifest is not an error.
+    pub fn forget(dir: &Path, names: &[String]) -> std::io::Result<()> {
+        if names.is_empty() {
+            return Ok(());
+        }
+        let _serialized = MANIFEST_WRITE.lock_ok();
+        let mut m = match Manifest::load(dir) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        let before = m.files.len();
+        m.files.retain(|e| !names.iter().any(|n| *n == e.name));
+        if m.files.len() == before {
+            return Ok(());
+        }
+        m.write_to(dir)
     }
 
     fn write_to(&self, dir: &Path) -> std::io::Result<()> {
@@ -767,6 +789,10 @@ fn walk_files(dir: &Path) -> std::io::Result<Vec<(String, u64, PathBuf)>> {
     }
     Ok(out)
 }
+
+/// Serializes every read-modify-write of a settle manifest in this
+/// process: `write_reconciled` and `forget`.
+static MANIFEST_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Memoized first-16k hashes for the rename rematch.
 ///
