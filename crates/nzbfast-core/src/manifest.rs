@@ -217,6 +217,34 @@ impl VerifyReport {
     }
 }
 
+impl Entry {
+    /// Judge the file at `path` against this entry - the per-file half
+    /// of [`Manifest::verify`], callable on a file somewhere ELSE (a
+    /// heal job's fresh copy is checked against the library's entry
+    /// before it is allowed to replace anything).
+    pub fn status_of(&self, path: &Path) -> std::io::Result<FileStatus> {
+        let e = self;
+        Ok(match std::fs::metadata(path) {
+            Err(_) if e.role == Role::Source => FileStatus::SourceGone,
+            Err(_) => FileStatus::Missing,
+            Ok(m) if m.len() != e.len => FileStatus::SizeMismatch { found: m.len() },
+            // Nothing recorded to check it against: no whole-file
+            // digest AND no grid. A grid alone is enough - that is
+            // the extracted-output entry `write_reconciled` hashes
+            // off the disk, and `check_entry` judges it on the grid.
+            Ok(_) if e.md5.is_none() && e.crc32s.is_empty() => FileStatus::PresentUnverified,
+            // The entry's OWN stride, never the manifest's: a shared
+            // season folder carries grids from several PAR2 sets.
+            Ok(_) => check_entry(e, e.bs, path)?,
+        })
+    }
+
+    /// The length the download proved for this file.
+    pub fn proved_len(&self) -> u64 {
+        self.len
+    }
+}
+
 impl Manifest {
     /// Build from the settle-time PAR2 set. `archive` says whether the
     /// covered files are volumes an extract tail will consume (their
@@ -620,20 +648,7 @@ impl Manifest {
         let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for e in &self.files {
             seen.insert(e.name.as_str());
-            let path = dir.join(&e.name);
-            let status = match std::fs::metadata(&path) {
-                Err(_) if e.role == Role::Source => FileStatus::SourceGone,
-                Err(_) => FileStatus::Missing,
-                Ok(m) if m.len() != e.len => FileStatus::SizeMismatch { found: m.len() },
-                // Nothing recorded to check it against: no whole-file
-                // digest AND no grid. A grid alone is enough - that is
-                // the extracted-output entry `write_reconciled` hashes
-                // off the disk, and `check_entry` judges it on the grid.
-                Ok(_) if e.md5.is_none() && e.crc32s.is_empty() => FileStatus::PresentUnverified,
-                // The entry's OWN stride, never the manifest's: a shared
-                // season folder carries grids from several PAR2 sets.
-                Ok(_) => check_entry(e, e.bs, &path)?,
-            };
+            let status = e.status_of(&dir.join(&e.name))?;
             report.files.push((e.name.clone(), status));
         }
         for (n, _, _) in walk_files(dir)? {
