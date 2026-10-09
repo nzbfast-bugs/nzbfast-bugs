@@ -191,6 +191,51 @@ fn priority_write_moves_the_row_to_its_run_position() {
     });
 }
 
+/// A priority write lands the row at the END of its new priority group,
+/// even when a lower-priority row (here a held duplicate) sits between
+/// two earlier members of that group. It must not jump ahead of a job
+/// of the same priority that was queued before it.
+#[test]
+fn priority_write_never_overtakes_an_earlier_job_of_the_same_priority() {
+    with_daemon("priogap", |d| {
+        {
+            let mut q = d.queue.lock_ok();
+            q.push_back(jv("a", "first", serde_json::json!({"priority": 0})));
+            q.push_back(jv(
+                "dup",
+                "held",
+                serde_json::json!({"priority": -3, "paused": true}),
+            ));
+            q.push_back(jv("b", "second", serde_json::json!({"priority": 0})));
+            q.push_back(jv("c", "raised", serde_json::json!({"priority": -1})));
+        }
+        {
+            let mut q = d.queue.lock_ok();
+            {
+                let job = q
+                    .iter()
+                    .find(|j| j.lock_ok().nzo_id == "c")
+                    .unwrap()
+                    .clone();
+                let mut g = job.lock_ok();
+                assert!(crate::serve::api::queue::apply_priority(d, &mut g, 0));
+            }
+            crate::serve::api::queue::reposition_for_priority(&mut q, "c");
+            q.iter()
+                .find(|j| j.lock_ok().nzo_id == "a")
+                .unwrap()
+                .lock_ok()
+                .paused = true;
+        }
+        let next = d.pick_job(false).expect("a runnable job");
+        assert_eq!(
+            next.lock_ok().nzo_id,
+            "b",
+            "b was Normal and queued before c; c must not run first"
+        );
+    });
+}
+
 // Lifted from `crates/nzbfast-daemon/src/daemon_tests.rs`.
 /// TODO 46: a user category is a category an *arr may be configured
 /// against, so its slug joins the list clients are offered - while the
