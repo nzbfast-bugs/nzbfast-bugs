@@ -178,15 +178,36 @@ fn tv_marker(tok: &str) -> Option<(u32, Option<u32>, Option<u32>)> {
     {
         return Some((0, ed.parse().ok(), None));
     }
-    // 3x07 form.
-    if let Some((s, e)) = t.split_once('x')
+    // 3x07 form, plus its multi-episode spellings "1x01x02" and
+    // "1x01-1x02" (same season only, second number higher).
+    if let Some((s, rest)) = t.split_once('x')
         && !s.is_empty()
         && s.len() <= 2
         && s.chars().all(|c| c.is_ascii_digit())
-        && (2..=3).contains(&e.len())
-        && e.chars().all(|c| c.is_ascii_digit())
     {
-        return Some((s.parse().ok()?, e.parse().ok(), None));
+        let ed = rest.bytes().take_while(u8::is_ascii_digit).count();
+        if !(2..=3).contains(&ed) {
+            return None;
+        }
+        let season: u32 = s.parse().ok()?;
+        let e1: u32 = rest[..ed].parse().ok()?;
+        let tail = &rest[ed..];
+        if tail.is_empty() {
+            return Some((season, Some(e1), None));
+        }
+        let second = tail
+            .strip_prefix('x')
+            .or_else(|| {
+                tail.strip_prefix('-').and_then(|r| {
+                    let sd = r.bytes().take_while(u8::is_ascii_digit).count();
+                    (sd > 0 && r[..sd].parse::<u32>().ok() == Some(season))
+                        .then(|| r[sd..].strip_prefix('x'))
+                        .flatten()
+                })
+            })
+            .filter(|e| (2..=3).contains(&e.len()) && e.bytes().all(|c| c.is_ascii_digit()))?;
+        let e2: u32 = second.parse().ok()?;
+        return (e2 > e1).then_some((season, Some(e1), Some(e2)));
     }
     None
 }
