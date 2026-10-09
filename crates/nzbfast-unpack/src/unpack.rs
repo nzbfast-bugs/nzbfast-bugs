@@ -2333,7 +2333,7 @@ pub fn verify_dir(dir: &std::path::Path) -> Result<DirVerify> {
                 dir.display()
             );
         } else {
-            info!(target: "par2", "no PAR2 files in {} - verification skipped", dir.display());
+            info!(target: "par2", "no readable PAR2 files in {} - verification skipped", dir.display());
         }
         return Ok(DirVerify::NothingToVerify);
     }
@@ -2743,3 +2743,7 @@ mod obfuscated_rar_extension_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+#[cfg(test)]
+#[path = "unpack/par2scan_special_files_tests.rs"]
+mod par2scan_special_files_tests;
