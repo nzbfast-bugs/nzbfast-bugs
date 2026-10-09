@@ -160,6 +160,18 @@ fn tv_marker(tok: &str) -> Option<(u32, Option<u32>, Option<u32>)> {
                 // a range.
                 let tail = &ep[ed.len()..];
                 let tail = tail.strip_prefix('-').unwrap_or(tail);
+                // Prefixed range "S01E01-S01E02": the season may be
+                // repeated, but only the SAME season and only before an E.
+                let tail = tail
+                    .strip_prefix('s')
+                    .and_then(|r| {
+                        let sd = r.bytes().take_while(u8::is_ascii_digit).count();
+                        (sd > 0
+                            && r[..sd].parse::<u32>().ok() == Some(season)
+                            && r[sd..].starts_with('e'))
+                        .then(|| &r[sd..])
+                    })
+                    .unwrap_or(tail);
                 let tail = tail.strip_prefix('e').unwrap_or(tail);
                 let e2 = ((2..=3).contains(&tail.len())
                     && tail.bytes().all(|c| c.is_ascii_digit()))
