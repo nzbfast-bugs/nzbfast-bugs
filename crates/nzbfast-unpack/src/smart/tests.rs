@@ -2664,3 +2664,38 @@ fn the_payload_names_the_job_only_when_it_reads_as_a_name() {
     .unwrap();
     assert_eq!(proved_release_stem(&d), None);
 }
+
+/// #357: a job whose only "video" is a symlink out of the job must not
+/// be filed into the shared season folder under the canonical episode
+/// name - that put a link to an arbitrary file in the user's library and
+/// claimed the slot as ours, while Play found nothing to serve.
+#[cfg(unix)]
+#[test]
+fn tv_organize_never_files_a_symlink_as_the_episode() {
+    let root = std::env::temp_dir().join(format!("nzbfast-tvlink-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let stem = "My.Show.S01E02.1080p.WEB.x264-TEST";
+    let out = root.join("tv").join(stem);
+    std::fs::create_dir_all(&out).unwrap();
+    let secret = root.join("secret.bin");
+    std::fs::write(&secret, b"outside").unwrap();
+    std::os::unix::fs::symlink(&secret, out.join(format!("{stem}.mkv"))).unwrap();
+    let dest = tv_organize(
+        &root.join("tv"),
+        stem,
+        &out,
+        " [1080p]",
+        &EpisodeTitles::default(),
+    );
+    let season = root.join("tv/My Show/Season 01");
+    let canonical = season.join("My Show - S01E02 [1080p].mkv");
+    let canonical_entry = std::fs::symlink_metadata(&canonical).is_ok();
+    let link_still_private = std::fs::symlink_metadata(out.join(format!("{stem}.mkv"))).is_ok();
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(dest, None, "a link-only job must stay unfiled");
+    assert!(
+        !canonical_entry,
+        "no canonical episode entry in the library"
+    );
+    assert!(link_still_private, "the link stays in the private folder");
+}
