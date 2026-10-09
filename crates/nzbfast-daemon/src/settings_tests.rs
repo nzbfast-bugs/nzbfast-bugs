@@ -1265,3 +1265,34 @@ fn the_apply_transaction_is_per_setting_name() {
 // What is asserted above is the MECHANISM the property rests on; the
 // interleave needs a barrier inside `apply_and_save`, which is
 // instrumentation this file should not add for it.
+
+/// A settings.json the daemon cannot READ (wrong owner after a run under
+/// another uid, a restrictive restore) is not an empty store. Saving one
+/// setting must not replace every other setting in it.
+#[test]
+#[cfg(unix)]
+fn saving_a_setting_never_replaces_a_store_it_could_not_read() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_t, d) = daemon_in("unreadable-store-save");
+    let p = d.settings_path.clone();
+    std::fs::write(
+        &p,
+        r#"{"out_dir":"/srv/complete","categories":"tv, movies, anime","web_username":"me"}"#,
+    )
+    .unwrap();
+    // No readable backup either - the state a store written by another
+    // uid is in (its .bak, if any, is that uid's too).
+    let _ = std::fs::remove_file(p.with_file_name("settings.json.bak"));
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let r = apply_and_save(&d, "auto_rename", "1");
+    assert_eq!(r, Ok((true, false)), "the save must be reported as not durable");
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let after: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+    assert_eq!(
+        after.get("categories").and_then(Value::as_str),
+        Some("tv, movies, anime"),
+        "save returned {r:?}; settings.json is now {after}"
+    );
+    assert_eq!(after.get("out_dir").and_then(Value::as_str), Some("/srv/complete"));
+}
