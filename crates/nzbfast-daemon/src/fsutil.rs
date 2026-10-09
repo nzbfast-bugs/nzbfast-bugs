@@ -286,6 +286,12 @@ pub fn fs_roots(cur_download: &std::path::Path) -> Value {
 
 /// Largest media file under `dir` (one level of subdirs too - extraction
 /// can nest a release folder).
+///
+/// Symlinks are skipped entirely, file and directory links alike: the
+/// result is handed to the OS opener, and an archive member can be a link
+/// (unrar recreates RAR5 redirection entries, and publishing moves them
+/// verbatim), so following one would open whatever the poster pointed it
+/// at. Same rule as the stream picker `find_completed_media`.
 pub fn largest_media_file(dir: &std::path::Path) -> Option<PathBuf> {
     const EXTS: [&str; 6] = [".mkv", ".mp4", ".avi", ".m4v", ".ts", ".wmv"];
     let mut best: Option<(u64, PathBuf)> = None;
@@ -296,21 +302,82 @@ pub fn largest_media_file(dir: &std::path::Path) -> Option<PathBuf> {
             .to_string_lossy()
             .to_ascii_lowercase();
         if EXTS.iter().any(|x| l.ends_with(x))
-            && let Ok(md) = p.metadata()
+            && let Ok(md) = std::fs::symlink_metadata(&p)
+            && md.file_type().is_file()
             && best.as_ref().is_none_or(|(sz, _)| md.len() > *sz)
         {
             best = Some((md.len(), p));
         }
     };
     for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let Ok(ft) = entry.file_type() else { continue };
         let p = entry.path();
-        if p.is_dir() {
+        if ft.is_dir() {
             for sub in std::fs::read_dir(&p).ok().into_iter().flatten().flatten() {
-                consider(sub.path());
+                if sub.file_type().is_ok_and(|t| t.is_file()) {
+                    consider(sub.path());
+                }
             }
-        } else {
+        } else if ft.is_file() {
             consider(p);
         }
     }
     best.map(|(_, p)| p)
+}
+
+/// Defense in depth for the "open" handlers: is `target` really inside
+/// `root` once every link on both is resolved? `target == root` counts.
+pub fn resolves_inside(target: &std::path::Path, root: &std::path::Path) -> bool {
+    match (std::fs::canonicalize(target), std::fs::canonicalize(root)) {
+        (Ok(t), Ok(r)) => t.starts_with(&r),
+        _ => false,
+    }
+}
+
+#[cfg(all(test, unix))]
+mod media_link_tests {
+    /// An extracted symlink (unrar recreates RAR5 redirection entries,
+    /// and `publish_into` moves them verbatim) named like media must not
+    /// be what History -> "open file" hands to `open`/`xdg-open`.
+    #[test]
+    fn largest_media_file_skips_file_and_dir_symlinks() {
+        let root = std::env::temp_dir().join(format!("lmf-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let job = root.join("job");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&job).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(job.join("feature.mkv"), vec![0u8; 10]).unwrap();
+        std::fs::write(outside.join("payload.command"), vec![0u8; 1000]).unwrap();
+        std::os::unix::fs::symlink(outside.join("payload.command"), job.join("movie.mkv")).unwrap();
+        std::os::unix::fs::symlink(&outside, job.join("Extras")).unwrap();
+        std::fs::write(outside.join("big.mp4"), vec![0u8; 5000]).unwrap();
+        let got = super::largest_media_file(&job).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(got, job.join("feature.mkv"), "picked {}", got.display());
+    }
+
+    #[test]
+    fn resolves_inside_refuses_a_link_out_of_the_job() {
+        let root = std::env::temp_dir().join(format!("lmf-guard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let job = root.join("job");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(job.join("sub")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(job.join("sub/a.mkv"), b"x").unwrap();
+        std::fs::write(outside.join("p.command"), b"x").unwrap();
+        std::os::unix::fs::symlink(outside.join("p.command"), job.join("m.mkv")).unwrap();
+        std::os::unix::fs::symlink(job.join("sub/a.mkv"), job.join("in.mkv")).unwrap();
+        let ok_file = super::resolves_inside(&job.join("sub/a.mkv"), &job);
+        let ok_dir = super::resolves_inside(&job, &job);
+        let ok_inner_link = super::resolves_inside(&job.join("in.mkv"), &job);
+        let out = super::resolves_inside(&job.join("m.mkv"), &job);
+        let dotdot = super::resolves_inside(&job.join("../outside/p.command"), &job);
+        let missing = super::resolves_inside(&job.join("nope.mkv"), &job);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(ok_file && ok_dir && ok_inner_link);
+        assert!(!out, "a link leaving the job folder must be refused");
+        assert!(!dotdot && !missing);
+    }
 }

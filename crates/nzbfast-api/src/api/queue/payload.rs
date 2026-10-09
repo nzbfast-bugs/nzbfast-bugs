@@ -1132,7 +1132,18 @@ pub(super) fn m_history(
                         } else {
                             dir.clone()
                         };
-                        json!({"status": os_open(&target), "path": target.to_string_lossy()})
+                        // Defense in depth (GHSA-w23p-fh3g-8r4x): the
+                        // OS opener runs whatever it is handed, and the
+                        // job folder's contents are the poster's. Never
+                        // open anything that resolves outside it.
+                        if target != dir
+                            && !nzbfast_daemon::fsutil::resolves_inside(&target, &dir)
+                        {
+                            json!({"status": false,
+                                   "error": "refusing to open a path outside the job folder"})
+                        } else {
+                            json!({"status": os_open(&target), "path": target.to_string_lossy()})
+                        }
                     }
                 }
             }
