@@ -1877,7 +1877,7 @@ fn jr_listgroups(d: &Arc<Daemon>) -> Value {
                 for (k, v) in size_fields("Downloaded", dl) {
                     o.insert(k, v);
                 }
-                for (k, v) in size_fields("Paused", 0) {
+                for (k, v) in size_fields("Paused", if g.paused { rem } else { 0 }) {
                     o.insert(k, v);
                 }
                 o.extend([
@@ -2983,6 +2983,9 @@ mod tail_truth_tests;
 
 #[cfg(test)]
 mod unforce_tests;
+
+#[cfg(test)]
+mod listgroups_paused_tests;
 
 #[cfg(test)]
 mod delete_durability_tests;
