@@ -109,7 +109,17 @@ fn damage(dir: &Path, name: &str) {
     let mut b = std::fs::read(&p).expect("read back");
     let at = b.len() / 2;
     b[at] ^= 0x40;
+    // Bit rot does not touch a file's mtime, and a heal reads a NEWER
+    // mtime as the user's own edit (#365) - so the rot keeps it.
+    let was = std::fs::metadata(&p)
+        .and_then(|m| m.modified())
+        .expect("mtime");
     std::fs::write(&p, b).expect("damage");
+    std::fs::File::options()
+        .write(true)
+        .open(&p)
+        .and_then(|f| f.set_modified(was))
+        .expect("keep mtime");
 }
 
 const EP1: &str = "Show.S01E01.1080p.WEB-DL.x264-GRP";
@@ -702,5 +712,126 @@ fn a_heal_whose_recorded_post_is_gone_re_fetches_the_release_by_search() {
         nzb.contains("heal-repost@y"),
         "the queued nzb must carry the article the index synthesised: {nzb}"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Stand a heal up on an UNMOVED library folder - the canonical
+/// directory the original job completed into, still named by its
+/// history row - with a user's own subtitle file beside the payload,
+/// and run the heal job's finalize exactly as `job.rs` does: with the
+/// row's own `replaces` as the A6 hand-over target.
+///
+/// Returns (scratch root, library folder, heal job's out_dir).
+fn finalize_a_heal(tag: &str, user_file: Option<&str>) -> (PathBuf, PathBuf, PathBuf) {
+    let dir = tdir(tag);
+    let d = test_daemon(&dir);
+    d.identity_lookup.store(false, Ordering::Relaxed);
+    let lib = crate::naming::out_dir(&d).join(EP1);
+    std::fs::create_dir_all(&lib).expect("library");
+    let sha = record_post(&d, &dir, "nzo-ep1", EP1);
+    for j in d.history.lock_ok().iter() {
+        j.lock_ok().out_dir = lib.clone();
+    }
+    settle(
+        &lib,
+        EP1,
+        &sha,
+        &[("Show - S01E01.mkv", body(20_000, 1))],
+        false,
+    );
+    if let Some(u) = user_file {
+        std::fs::write(lib.join(u), b"the user's own file").expect("user file");
+    }
+    damage(&lib, "Show - S01E01.mkv");
+
+    let out = crate::heal::heal_start(&d, &lib.to_string_lossy(), "").expect("heal");
+    assert_eq!(out["started"].as_array().map(Vec::len), Some(1), "{out}");
+    let (nzo, out_dir, replaces) = {
+        let q = d.queue.lock_ok();
+        q.iter()
+            .map(|j| j.lock_ok())
+            .find(|g| g.origin.starts_with("heal:"))
+            .map(|g| (g.nzo_id.clone(), g.out_dir.clone(), g.replaces.clone()))
+            .expect("heal row")
+    };
+    // The heal download finished: its own folder holds the whole post,
+    // repaired.
+    std::fs::create_dir_all(&out_dir).unwrap();
+    std::fs::write(out_dir.join("Show - S01E01.mkv"), body(20_000, 1)).unwrap();
+    let _ = crate::job_finalize::finalize_payload(
+        d.clone(),
+        nzo,
+        out_dir.clone(),
+        replaces,
+        None,
+        dir.join("job.nzb"),
+        String::new(),
+        EP1.into(),
+        0,
+        Vec::new(),
+        String::new(),
+        false,
+    );
+    (dir, lib, out_dir)
+}
+
+/// #365. A heal must never delete a file it did not flag. It used to be
+/// queued with `replaces = <the library folder>`, so finalize's A6
+/// hand-over parked the WHOLE folder aside and `remove_dir_all`ed it on
+/// commit - the user's subtitles went with the damaged film.
+#[test]
+fn a_heal_never_deletes_files_it_did_not_flag() {
+    let (dir, lib, _) = finalize_a_heal("keep-user-files", Some("Show - S01E01.en.srt"));
+    assert_eq!(
+        std::fs::read(lib.join("Show - S01E01.en.srt"))
+            .ok()
+            .as_deref(),
+        Some(&b"the user's own file"[..]),
+        "the heal deleted a file it never re-downloaded"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// #365, the other half: the flagged file IS replaced in place, by a
+/// copy that verifies, and the heal job's own duplicate of the post is
+/// dropped once nothing is left unhealed.
+#[test]
+fn a_heal_replaces_the_damaged_file_in_place() {
+    let (dir, lib, out_dir) = finalize_a_heal("replace-in-place", None);
+    assert_eq!(
+        std::fs::read(lib.join("Show - S01E01.mkv")).expect("healed file"),
+        body(20_000, 1),
+        "the damaged file was not replaced"
+    );
+    let p = crate::heal::plan(&lib).expect("plan");
+    assert!(p.is_empty() && p.edited.is_empty(), "still flagged: {p:?}");
+    assert!(
+        !out_dir.exists(),
+        "the heal's duplicate payload was left behind"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// #365: a file the user CHANGED after the manifest was written - a
+/// remux or re-tag, which reads as SizeMismatch/Damaged - is their
+/// version, not rot. It is reported and never queued for a heal.
+#[test]
+fn a_file_the_user_edited_is_reported_not_healed() {
+    let dir = tdir("edited");
+    let lib = dir.join("library");
+    std::fs::create_dir_all(&lib).expect("library");
+    settle(
+        &lib,
+        EP1,
+        "sha1",
+        &[("Show - S01E01.mkv", body(20_000, 1))],
+        false,
+    );
+    // Strictly newer than the manifest, as a real edit days later is.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    std::fs::write(lib.join("Show - S01E01.mkv"), b"the user's remux").unwrap();
+    let p = crate::heal::plan(&lib).expect("plan");
+    assert!(p.targets.is_empty(), "an edited file was queued: {p:?}");
+    assert_eq!(p.edited, vec!["Show - S01E01.mkv".to_string()]);
     let _ = std::fs::remove_dir_all(&dir);
 }
