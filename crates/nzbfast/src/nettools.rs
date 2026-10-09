@@ -1067,6 +1067,11 @@ fn scoped_v6_refusal(host: &str) -> anyhow::Error {
 /// A PATH is refused rather than ignored. Nothing here serves the API
 /// under a prefix, and silently dropping one would send the request
 /// somewhere the user did not name.
+/// A `:port` spelling a TCP port can actually take: 1..=65535, digits only.
+fn is_port(p: &str) -> bool {
+    p.bytes().all(|b| b.is_ascii_digit()) && p.parse::<u16>().is_ok_and(|n| n > 0)
+}
+
 fn daemon_base(host: &str, port: u16) -> Result<String> {
     let h = host.trim();
     if h.is_empty() {
@@ -1103,7 +1108,7 @@ fn daemon_base(host: &str, port: u16) -> Result<String> {
             }
             if after
                 .strip_prefix(':')
-                .is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+                .is_some_and(is_port)
             {
                 return Ok(format!("http://{h}"));
             }
@@ -1124,8 +1129,7 @@ fn daemon_base(host: &str, port: u16) -> Result<String> {
             Some((hh, p))
                 if !hh.is_empty()
                     && !hh.contains(':')
-                    && !p.is_empty()
-                    && p.bytes().all(|b| b.is_ascii_digit()) =>
+                    && is_port(p) =>
             {
                 format!("http://{hh}:{p}")
             }
@@ -1163,12 +1167,17 @@ fn daemon_base(host: &str, port: u16) -> Result<String> {
     if rest.parse::<std::net::Ipv6Addr>().is_ok() {
         return Ok(format!("{scheme}://[{rest}]:{port}"));
     }
-    let has_port = if let Some(inner) = rest.strip_prefix('[') {
-        inner.split_once("]:").is_some()
+    let port_part = if let Some(inner) = rest.strip_prefix('[') {
+        inner.split_once("]:").map(|(_, p)| p)
     } else {
         rest.rsplit_once(':')
-            .is_some_and(|(_, p)| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+            .filter(|(_, p)| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+            .map(|(_, p)| p)
     };
+    if port_part.is_some_and(|p| !is_port(p)) {
+        anyhow::bail!("--host {h}: the port must be a number from 1 to 65535");
+    }
+    let has_port = port_part.is_some();
     Ok(if has_port {
         format!("{scheme}://{rest}")
     } else {
@@ -1973,6 +1982,32 @@ mod stream_submit {
         assert!(
             daemon_base("https://[2001:db8::5]", 6789).is_ok(),
             "and that spelling round-trips through daemon_base"
+        );
+    }
+
+    /// A port outside 1..=65535 is refused at the spelling, in every arm,
+    /// rather than built into a base that fails at connect time under a
+    /// "no daemon at ..." headline.
+    #[test]
+    fn a_port_out_of_range_is_refused() {
+        for bad in [
+            "nas.local:99999",
+            "127.0.0.1:65536",
+            "[::1]:70000",
+            "http://nas.local:99999",
+            "https://[::1]:65536",
+            "nas.local:0",
+        ] {
+            assert!(
+                daemon_base(bad, 6789).is_err(),
+                "{bad:?} must be refused, got {:?}",
+                daemon_base(bad, 6789)
+            );
+        }
+        // The top of the range still works.
+        assert_eq!(
+            daemon_base("nas.local:65535", 1).unwrap(),
+            "http://nas.local:65535"
         );
     }
 
