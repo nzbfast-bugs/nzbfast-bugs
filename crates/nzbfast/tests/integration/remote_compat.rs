@@ -572,3 +572,23 @@ fn sab_remote_arms_cover_lunaseas_calls() {
     // "" is SAB's "no cap set"; a "0" here would read as a 0 B/s cap.
     assert_eq!(st["speedlimit_abs"].as_str(), Some(""), "{v}");
 }
+
+/// NZBGet's `log(IDFrom, NumberOfEntries)`: one of the two is set and
+/// the other is 0. `IDFrom` set with `NumberOfEntries = 0` asks for
+/// every entry from that ID on - the incremental poll NZBGet clients
+/// use.
+#[test]
+fn jsonrpc_log_honours_id_from() {
+    let dir = scratch("logidfrom");
+    let d = serve(&dir);
+    let tail = rpc(d.port, "log", "[0, 3]")["result"].clone();
+    let tail = tail.as_array().expect("log result is a list");
+    assert!(!tail.is_empty(), "a started daemon has logged something");
+    let from = rpc(d.port, "log", "[1, 0]")["result"].clone();
+    let from = from.as_array().expect("log result is a list");
+    assert!(
+        !from.is_empty(),
+        "log(IDFrom=1, NumberOfEntries=0) returned nothing while log(0, 3) returned {}",
+        tail.len()
+    );
+}
