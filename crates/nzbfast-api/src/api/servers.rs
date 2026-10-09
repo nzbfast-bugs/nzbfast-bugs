@@ -126,7 +126,7 @@ fn server_stats_json(
                     bump(eo, "month", b);
                     tot.1 += b;
                 }
-                if day.as_str() >= week_cut.as_str() {
+                if day.as_str() >= week_cut.as_str() && day.as_str() <= today.as_str() {
                     bump(eo, "week", b);
                     tot.2 += b;
                 }
