@@ -1518,7 +1518,9 @@ fn media_marker(toks: &[&str]) -> Option<(Kind, usize)> {
 /// is not recognised by this rule - it has no underscore to prove the
 /// convention - and falls through to the movie path as it does today.
 fn scene_media(body: &str) -> Option<(Kind, String, String, Option<u32>)> {
-    if body.contains(['.', ' ']) {
+    // Dots may stand in for spaces like underscores do, but a dotted
+    // stem only qualifies through a format marker (see `kind` below).
+    if body.contains(' ') {
         return None;
     }
     let mut fields: Vec<&str> = body.split('-').filter(|f| !f.is_empty()).collect();
@@ -1539,7 +1541,7 @@ fn scene_media(body: &str) -> Option<(Kind, String, String, Option<u32>)> {
     // Any video marker anywhere disqualifies: "the-flash-s01e01-720p"
     // has this exact field shape and is an episode.
     fn word_of(f: &str) -> Vec<&str> {
-        f.split('_').filter(|w| !w.is_empty()).collect()
+        f.split(['_', '.']).filter(|w| !w.is_empty()).collect()
     }
     for f in &fields {
         for w in word_of(f) {
@@ -1576,7 +1578,7 @@ fn scene_media(body: &str) -> Option<(Kind, String, String, Option<u32>)> {
     // `Artist-Album-YEAR-GROUP` shape is the music convention.
     let kind = match marker {
         Some(k) => k,
-        None if dated && body.contains('_') => Kind::Music,
+        None if dated && !body.contains('.') && body.contains('_') => Kind::Music,
         None => return None,
     };
     let year = fields
