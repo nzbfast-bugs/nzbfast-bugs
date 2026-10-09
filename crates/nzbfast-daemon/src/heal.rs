@@ -137,6 +137,19 @@ pub struct HealPlan {
     /// Reachable on a manifest written by a build older than stage 1's
     /// per-entry provenance, and on nothing this binary writes.
     pub unidentified: Vec<String>,
+    /// Flagged entries whose file was CHANGED after the manifest was
+    /// written (its mtime is newer than the manifest's), so the change
+    /// is read as the user's own - a remux, a re-tag, a trim - and
+    /// left alone. Bit rot does not touch a file's mtime; an edit does.
+    /// Reported, never healed: re-downloading over a file somebody
+    /// deliberately changed would destroy their version (#365).
+    pub edited: Vec<String>,
+}
+
+fn manifest_mtime(dir: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(dir.join(crate::manifest::MANIFEST_NAME))
+        .and_then(|m| m.modified())
+        .ok()
 }
 
 impl HealPlan {
@@ -187,6 +200,8 @@ pub(super) const MAX_HEAL_JOBS: usize = 16;
 pub fn plan(dir: &Path) -> std::io::Result<HealPlan> {
     let m = Manifest::load(dir)?;
     let report = m.verify(dir)?;
+    let manifest_mtime = manifest_mtime(dir);
+    let mut out = HealPlan::default();
     let damaged: std::collections::HashSet<&str> = report
         .files
         .iter()
@@ -197,8 +212,20 @@ pub fn plan(dir: &Path) -> std::io::Result<HealPlan> {
             )
         })
         .map(|(n, _)| n.as_str())
+        .filter(|n| {
+            // #365: a present file modified after the manifest was
+            // written is the user's edit, not rot. A missing file has
+            // no mtime to judge and is still healed.
+            let edited = match (manifest_mtime, std::fs::metadata(dir.join(n))) {
+                (Some(mt), Ok(meta)) => meta.modified().is_ok_and(|f| f > mt),
+                _ => false,
+            };
+            if edited {
+                out.edited.push((*n).to_string());
+            }
+            !edited
+        })
         .collect();
-    let mut out = HealPlan::default();
     // Walked over the MANIFEST rather than over the report, so the
     // grouping reads each entry's own `job`/`nzb_sha` - the report
     // carries names and verdicts and no provenance at all. Manifest
@@ -334,6 +361,7 @@ pub fn heal_offer(d: &Daemon, dir: &str) -> std::result::Result<Value, String> {
         "dir": dir.to_string_lossy(),
         "targets": rows,
         "unidentified": plan.unidentified,
+        "edited": plan.edited,
         "max_jobs": MAX_HEAL_JOBS,
     }))
 }
@@ -509,6 +537,15 @@ pub(super) fn heal_one(
             Some(job) => {
                 let mut g = job.lock_ok();
                 g.heal_dir = dir.to_path_buf();
+                // #365: NEVER the A6 whole-folder hand-over. The damaged
+                // folder is still the original job's completed payload,
+                // so `choose_out_dir` recorded it as this row's
+                // `replaces` - and `publish_over_previous` + `commit`
+                // would then delete the whole library folder, user files
+                // and all, to put this post in its place. A heal replaces
+                // the flagged files only; `apply_heal` does that at
+                // finalize.
+                g.replaces = None;
                 g.paused = false;
                 // ...and the OTHER thing `-2` means to somebody else.
                 // `insurance_at_add` reads priority -2 as "the user
@@ -558,6 +595,115 @@ pub(super) fn heal_one(
         "files": t.files,
         "replaces": replaces,
     }))
+}
+
+/// What [`apply_heal`] did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct HealApplied {
+    /// Flagged files now replaced by a verified copy.
+    pub replaced: Vec<String>,
+    /// Flagged files the heal job's output held no verified copy of.
+    pub unhealed: Vec<String>,
+}
+
+/// The finalize half of a heal: put verified copies of the files the
+/// library manifest flags for post `sha` over the damaged ones in
+/// `heal_dir`, taking them from the heal job's own output in `src`.
+///
+/// Touches NOTHING else in `heal_dir` (#365): the plan is re-run here,
+/// so a file the user edited since (see [`HealPlan::edited`]) or that
+/// was repaired some other way is left alone, and every file the
+/// manifest does not flag - subtitles, artwork, other episodes of a
+/// season folder - is never written. Each copy is checked against the
+/// library's OWN entry before it may replace anything, and lands by a
+/// same-directory rename, so a damaged file is only ever swapped for a
+/// proven one.
+///
+/// The copy is found by name first, then by proved length and content
+/// anywhere under `src` - the heal job's names are the post's, and a
+/// filed library may have renamed them (#366).
+pub fn apply_heal(heal_dir: &Path, src: &Path, sha: &str) -> std::io::Result<HealApplied> {
+    let m = Manifest::load(heal_dir)?;
+    let p = plan(heal_dir)?;
+    let mt = manifest_mtime(heal_dir);
+    let mut out = HealApplied::default();
+    let names: Vec<&String> = p
+        .targets
+        .iter()
+        .filter(|t| t.nzb_sha == sha)
+        .flat_map(|t| t.files.iter())
+        .collect();
+    if names.is_empty() {
+        return Ok(out);
+    }
+    let pool = files_under(src);
+    for name in names {
+        let Some(e) = m.files.iter().find(|e| &e.name == name) else {
+            continue;
+        };
+        let good = |c: &Path| matches!(e.status_of(c), Ok(FileStatus::Ok));
+        let direct = src.join(name);
+        let found = if good(&direct) {
+            Some(direct)
+        } else {
+            pool.iter()
+                .filter(|c| std::fs::metadata(c).is_ok_and(|md| md.len() == e.proved_len()))
+                .find(|c| good(c))
+                .cloned()
+        };
+        let Some(from) = found else {
+            out.unhealed.push(name.clone());
+            continue;
+        };
+        let dst = heal_dir.join(name);
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let tmp = dst.with_file_name(format!(
+            ".{}.nzbfast-heal.tmp",
+            dst.file_name().unwrap_or_default().to_string_lossy()
+        ));
+        let res = std::fs::copy(&from, &tmp).and_then(|_| {
+            let f = std::fs::OpenOptions::new().write(true).open(&tmp)?;
+            f.sync_all()?;
+            // The healed file keeps an mtime no newer than the
+            // manifest's, so a later rot of it reads as rot rather than
+            // as the user's edit.
+            if let Some(mt) = mt {
+                f.set_modified(mt)?;
+            }
+            std::fs::rename(&tmp, &dst)
+        });
+        if let Err(err) = res {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(err);
+        }
+        out.replaced.push(name.clone());
+    }
+    Ok(out)
+}
+
+/// Regular files under `dir`, bounded and symlink-free.
+fn files_under(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![(dir.to_path_buf(), 0usize)];
+    while let Some((d, depth)) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            let Ok(t) = e.file_type() else { continue };
+            if t.is_dir() && depth < 4 {
+                stack.push((e.path(), depth + 1));
+            } else if t.is_file() {
+                out.push(e.path());
+            }
+            if out.len() >= 10_000 {
+                return out;
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
