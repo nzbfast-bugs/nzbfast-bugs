@@ -867,6 +867,11 @@ fn route_login(req: tiny_http::Request, d: &Arc<Daemon>) {
         .unwrap_or_default();
     let user = fields.get("username").map(String::as_str).unwrap_or("");
     let pass = fields.get("password").map(String::as_str).unwrap_or("");
+    // Taken BEFORE the credential is read: a credential change that
+    // lands while this sign-in is being verified signs every browser out,
+    // and must sign this one out too rather than let it mint a session
+    // from the credential that was just revoked.
+    let epoch = d.sessions.epoch();
     let want_user = d.web_username.lock_ok().clone().unwrap_or_default();
     let want_hash = d.web_password.lock_ok().clone().unwrap_or_default();
     // BOTH halves are checked, and the password verification runs even
@@ -922,7 +927,18 @@ fn route_login(req: tiny_http::Request, d: &Arc<Daemon>) {
         );
         return;
     }
-    let Some((id, csrf)) = d.sessions.create() else {
+    if d.sessions.epoch() != epoch {
+        // The credential changed under this sign-in. "Ask me again", like
+        // the busy answer: re-checked against the CURRENT credential.
+        let mut resp =
+            json_resp(json!({"status": false, "error": "login.busy"})).with_status_code(503);
+        if let Ok(h) = tiny_http::Header::from_bytes(&b"Retry-After"[..], &b"1"[..]) {
+            resp.add_header(h);
+        }
+        let _ = req.respond(resp);
+        return;
+    }
+    let Some((id, csrf)) = d.sessions.create_since(Some(epoch)) else {
         let _ = req.respond(
             json_resp(json!({"status": false, "error": "login.nornd"})).with_status_code(500),
         );

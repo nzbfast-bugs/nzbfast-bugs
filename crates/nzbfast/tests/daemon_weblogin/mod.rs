@@ -1083,3 +1083,50 @@ async fn the_owner_still_signs_in_while_that_same_address_floods_the_door() {
     .await
     .unwrap();
 }
+
+/// A password change that lands WHILE a sign-in with the old password is
+/// being verified must not leave that sign-in holding a live session: the
+/// change is supposed to sign every browser out, and a session minted
+/// from the revoked password afterwards is exactly what it revokes.
+///
+/// `NZBFAST_TEST_VERIFY_HOLD_MS` holds the verification open so the
+/// change deterministically lands inside it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_password_change_during_a_sign_in_revokes_that_sign_in() {
+    let (d, _dir) = daemon_with_key_env(
+        "weblogin-race",
+        "600",
+        &[("NZBFAST_TEST_VERIFY_HOLD_MS", "2000")],
+    )
+    .await;
+    let port = d.port;
+    tokio::task::spawn_blocking(move || {
+        configure_login(port, "owner", "correct horse");
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            let r = req(
+                port,
+                "POST /login",
+                "",
+                Some("username=owner&password=correct+horse"),
+            );
+            let _ = tx.send(r);
+        });
+        std::thread::sleep(std::time::Duration::from_millis(700));
+        configure_login(port, "owner", "a different one");
+        let old = rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("the /login POST never answered");
+        if status(&old) == 200 {
+            let (jar, csrf) = cookies_of(&old);
+            let hdrs = format!("{jar}X-CSRF-Token: {csrf}\r\n");
+            let after = req(port, "GET /api?mode=get_config&output=json", &hdrs, None);
+            assert!(
+                after.contains("API Key Required"),
+                "a session signed in with the OLD password outlived the password change: {after}"
+            );
+        }
+    })
+    .await
+    .unwrap();
+}
