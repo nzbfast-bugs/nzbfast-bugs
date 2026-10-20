@@ -939,7 +939,43 @@ pub fn bare_stem(stem: &str) -> &str {
 /// gate threw seven away as conflicts against stems like
 /// "uHpvK7XRYNxbvVQbxuW2fGBAPRpMkJuc.7z". One function, one verdict.
 pub fn stem_is_a_name(stem: &str) -> bool {
-    !looks_obfuscated(bare_stem(stem))
+    !looks_obfuscated(volume_core(stem))
+}
+
+/// `stem` with its file furniture removed: a zero-padded split tail
+/// (`.001`), one extension, and a multi-volume marker (`.part01`,
+/// `.vol00+01`). What is left is the part a POSTER chose, which is the
+/// only part that can say whether the name is a name or a hash - a
+/// hash does not stop being one by carrying `.part01.rar`.
+fn volume_core(stem: &str) -> &str {
+    let mut s = stem;
+    if let Some((b, e)) = s.rsplit_once('.')
+        && !b.is_empty()
+        && (2..=4).contains(&e.len())
+        && e.starts_with('0')
+        && e.bytes().all(|c| c.is_ascii_digit())
+    {
+        s = b;
+    }
+    s = bare_stem(s);
+    if let Some((b, e)) = s.rsplit_once('.')
+        && !b.is_empty()
+    {
+        let le = e.to_ascii_lowercase();
+        let vol = |rest: &str, extra: &[u8]| {
+            !rest.is_empty()
+                && rest.bytes().any(|c| c.is_ascii_digit())
+                && rest
+                    .bytes()
+                    .all(|c| c.is_ascii_digit() || extra.contains(&c))
+        };
+        if le.strip_prefix("part").is_some_and(|r| vol(r, b""))
+            || le.strip_prefix("vol").is_some_and(|r| vol(r, b"+-"))
+        {
+            s = b;
+        }
+    }
+    s
 }
 
 /// Is this name exactly its own text twice, with no separator? Returns
