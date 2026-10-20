@@ -856,3 +856,18 @@ fn is_date_bucket_takes_dates_and_nothing_else() {
         assert!(!is_date_bucket(k), "{k}");
     }
 }
+
+/// A day bucket dated AFTER today (a clock that was ahead when it was
+/// billed, then corrected) is not part of the last seven days - the
+/// history body's `week_size` already leaves it out.
+#[test]
+fn a_future_dated_bucket_is_not_in_this_week() {
+    let today = day_num(2026, 8, 28);
+    let mut u = serde_json::Map::new();
+    u.insert("2026-08-28".into(), json!({"a.example": 100u64}));
+    u.insert("2026-08-30".into(), json!({"a.example": 7u64}));
+    u.insert("2027-01-15".into(), json!({"a.example": 50u64}));
+    let got = server_stats_json(&u, today, &[]);
+    assert_eq!(got["week"], json!(100u64));
+    assert_eq!(got["servers"]["a.example"]["week"], json!(100u64));
+}
