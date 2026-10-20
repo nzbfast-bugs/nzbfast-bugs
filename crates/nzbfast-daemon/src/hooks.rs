@@ -778,6 +778,12 @@ fn post_event(p: &Pending) -> Result<u16, SendErr> {
         )
     };
     match crate::netfetch::send_keeping_refusal(req, &p.body[..]) {
+        // 2xx only: redirects are off, so a 3xx is a delivery that went
+        // nowhere - terminal, like every other non-2xx answer.
+        Ok(r) if !r.status().is_success() => {
+            let code = r.status().as_u16();
+            Err(SendErr::Terminal(code, format!("HTTP {code}")))
+        }
         Ok(r) => Ok(r.status().as_u16()),
         // `Refusal`'s Display is `netfetch::error_brief`, which is the
         // rule this used to reach into `notify::transport_brief` for:
