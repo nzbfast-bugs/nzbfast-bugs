@@ -2937,18 +2937,28 @@ pub fn handle_jsonrpc(
         "pausepost" | "resumepost" | "pausescan" | "resumescan" => json!(true),
         "servervolumes" => json!([]),
         "log" | "loadlog" => {
+            // NZBGet's `log(IDFrom, NumberOfEntries)`: one is set, the
+            // other 0. IDs are the capture's running line count, so the
+            // same line keeps its ID from one call to the next.
+            let id_from = params.first().and_then(Value::as_u64).unwrap_or(0);
             let n = params.get(1).and_then(Value::as_u64).unwrap_or(100) as usize;
+            let raw = if n == 0 && id_from > 0 {
+                nzbkit::logtee::since(id_from - 1, 1000)
+            } else {
+                nzbkit::logtee::tail(n.min(1000))
+            };
+            let first_id = nzbkit::logtee::mark().saturating_sub(raw.len() as u64) + 1;
             // §163 item 5: scrubbed on the way out. This tail used to go
             // into the response verbatim, which made it the one door
             // every credential that reached the ring by some path we did
             // not guard could leave by - and it is a door remote apps
             // call over the network.
-            let lines = super::logscrub::LogScrub::new(d).tail(nzbkit::logtee::tail(n.min(1000)));
+            let lines = super::logscrub::LogScrub::new(d).tail(raw);
             let now = unix_now();
             let entries: Vec<Value> = lines
                 .iter()
                 .enumerate()
-                .map(|(i, l)| json!({"ID": i as u64 + 1, "Kind": "INFO", "Time": now, "Text": l}))
+                .map(|(i, l)| json!({"ID": first_id + i as u64, "Kind": "INFO", "Time": now, "Text": l}))
                 .collect();
             json!(entries)
         }
