@@ -413,6 +413,21 @@ pub(super) fn update_settings(
     // read-modify-write so concurrent saves can't drop each other's keys.
     static IO: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _g = IO.lock_ok();
+    // A store that EXISTS but yields nothing (unreadable primary with no
+    // readable .bak - a uid change, a restrictive restore) is not an
+    // empty store. `load_settings` degrades to {} there, and writing
+    // that back plus one key would replace every saved setting with no
+    // copy kept anywhere. Refuse: the caller reports the change as not
+    // durable, and the file survives for the user to fix.
+    if path.exists() && crate::persist::json_store_unreadable(path) {
+        error!(
+            target: "settings",
+            "not writing {}: it exists but could not be read, and rewriting it would \
+             erase every saved setting - fix its permissions or contents",
+            path.display()
+        );
+        return false;
+    }
     let mut map = load_settings(path);
     f(&mut map);
     match serde_json::to_string_pretty(&Value::Object(map)) {
