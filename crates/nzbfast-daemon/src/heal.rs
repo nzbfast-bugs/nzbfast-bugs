@@ -139,6 +139,19 @@ pub struct HealPlan {
     pub unidentified: Vec<String>,
 }
 
+fn manifest_mtime(dir: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(dir.join(crate::manifest::MANIFEST_NAME))
+        .and_then(|m| m.modified())
+        .ok()
+}
+
+/// How long a FINISHED heal of one post into one folder holds off
+/// another (#366). A heal that completed and left the folder still
+/// damaged for that post did not work, and doing the identical
+/// download again on the next sweep will not work either - it is a
+/// whole post re-fetched per sweep, forever, on a metered line.
+pub(super) const HEAL_RETRY_COOLDOWN_SECS: i64 = 7 * 24 * 3600;
+
 impl HealPlan {
     pub fn is_empty(&self) -> bool {
         self.targets.is_empty() && self.unidentified.is_empty()
@@ -438,6 +451,25 @@ pub(super) fn heal_one(
     }) {
         return Err("a repair of that post in this folder is already on the queue".into());
     }
+    // #366: ...and one that already FINISHED recently is the answer too.
+    // We are only here because the folder is still damaged for this
+    // post, so that repair did not take; repeating it would spend the
+    // same bytes for the same result.
+    let now = crate::job::unix_now();
+    if d.history.lock_ok().iter().any(|j| {
+        let g = j.lock_ok();
+        g.origin == heal_origin(&t.nzb_sha)
+            && g.heal_dir == dir
+            && !g.tombstone
+            && g.finished_unix
+                .is_some_and(|f| now.saturating_sub(f) < HEAL_RETRY_COOLDOWN_SECS)
+    }) {
+        return Err(
+            "a repair of that post in this folder already ran recently and the \
+                    folder is still damaged - not downloading it again yet"
+                .into(),
+        );
+    }
     // THE RECORDED POST FIRST, and this is the ordering that makes a
     // heal different from a hunt. §282 hunts because the post is
     // dead; a heal runs because the DISK is damaged, and the post
@@ -558,6 +590,115 @@ pub(super) fn heal_one(
         "files": t.files,
         "replaces": replaces,
     }))
+}
+
+/// What [`apply_heal`] did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct HealApplied {
+    /// Flagged files now replaced by a verified copy.
+    pub replaced: Vec<String>,
+    /// Flagged files the heal job's output held no verified copy of.
+    pub unhealed: Vec<String>,
+}
+
+/// The finalize half of a heal: put verified copies of the files the
+/// library manifest flags for post `sha` over the damaged ones in
+/// `heal_dir`, taking them from the heal job's own output in `src`.
+///
+/// Touches NOTHING else in `heal_dir` (#365): the plan is re-run here,
+/// so a file that
+/// was repaired some other way is left alone, and every file the
+/// manifest does not flag - subtitles, artwork, other episodes of a
+/// season folder - is never written. Each copy is checked against the
+/// library's OWN entry before it may replace anything, and lands by a
+/// same-directory rename, so a damaged file is only ever swapped for a
+/// proven one.
+///
+/// The copy is found by name first, then by proved length and content
+/// anywhere under `src` - the heal job's names are the post's, and a
+/// filed library may have renamed them (#366).
+pub fn apply_heal(heal_dir: &Path, src: &Path, sha: &str) -> std::io::Result<HealApplied> {
+    let m = Manifest::load(heal_dir)?;
+    let p = plan(heal_dir)?;
+    let mt = manifest_mtime(heal_dir);
+    let mut out = HealApplied::default();
+    let names: Vec<&String> = p
+        .targets
+        .iter()
+        .filter(|t| t.nzb_sha == sha)
+        .flat_map(|t| t.files.iter())
+        .collect();
+    if names.is_empty() {
+        return Ok(out);
+    }
+    let pool = files_under(src);
+    for name in names {
+        let Some(e) = m.files.iter().find(|e| &e.name == name) else {
+            continue;
+        };
+        let good = |c: &Path| matches!(e.status_of(c), Ok(FileStatus::Ok));
+        let direct = src.join(name);
+        let found = if good(&direct) {
+            Some(direct)
+        } else {
+            pool.iter()
+                .filter(|c| std::fs::metadata(c).is_ok_and(|md| md.len() == e.proved_len()))
+                .find(|c| good(c))
+                .cloned()
+        };
+        let Some(from) = found else {
+            out.unhealed.push(name.clone());
+            continue;
+        };
+        let dst = heal_dir.join(name);
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let tmp = dst.with_file_name(format!(
+            ".{}.nzbfast-heal.tmp",
+            dst.file_name().unwrap_or_default().to_string_lossy()
+        ));
+        let res = std::fs::copy(&from, &tmp).and_then(|_| {
+            let f = std::fs::OpenOptions::new().write(true).open(&tmp)?;
+            f.sync_all()?;
+            // The healed file keeps an mtime no newer than the
+            // manifest's, so a later rot of it reads as rot rather than
+            // as the user's edit.
+            if let Some(mt) = mt {
+                f.set_modified(mt)?;
+            }
+            std::fs::rename(&tmp, &dst)
+        });
+        if let Err(err) = res {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(err);
+        }
+        out.replaced.push(name.clone());
+    }
+    Ok(out)
+}
+
+/// Regular files under `dir`, bounded and symlink-free.
+fn files_under(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![(dir.to_path_buf(), 0usize)];
+    while let Some((d, depth)) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            let Ok(t) = e.file_type() else { continue };
+            if t.is_dir() && depth < 4 {
+                stack.push((e.path(), depth + 1));
+            } else if t.is_file() {
+                out.push(e.path());
+            }
+            if out.len() >= 10_000 {
+                return out;
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]

@@ -112,6 +112,14 @@ pub(super) fn finalize_payload(
     // unpacked copy of that release and left a folder of archives
     // nothing can open. See `job_publish::Published`. (N1,
     // reports/code-audit-2026-09-17.)
+    // #366: a HEAL job's payload is not a release to file. It exists to
+    // put verified copies of the flagged files back over the damaged
+    // ones in the library folder. Filing it would refuse to land on the
+    // damaged episode (the name is taken) and leave the good copy in a
+    // private folder while the library stays damaged.
+    if let Some((heal_dir, sha)) = heal_of(&d3, &nzo3) {
+        return finalize_heal(&nzo3, &out2, &heal_dir, &sha);
+    }
     let mut out2 = out2;
     let mut published = repl2.and_then(|canon| publish_over_previous(&out2, &canon));
     let mut moved: Option<PathBuf> = None;
@@ -389,6 +397,64 @@ pub(super) fn finalize_payload(
         identified: identify,
         cleaned,
     }
+}
+
+/// The library folder and post sha of job `nzo`, when it is a heal.
+fn heal_of(d: &Daemon, nzo: &str) -> Option<(PathBuf, String)> {
+    let take = |j: &Arc<Mutex<Job>>| {
+        let g = j.lock_ok();
+        (g.nzo_id == nzo).then(|| (g.heal_dir.clone(), g.origin.clone()))
+    };
+    let (dir, origin) = d
+        .queue
+        .lock_ok()
+        .iter()
+        .find_map(take)
+        .or_else(|| d.history.lock_ok().iter().find_map(take))?;
+    let sha = origin.strip_prefix("heal:")?;
+    (!dir.as_os_str().is_empty()).then(|| (dir, sha.to_string()))
+}
+
+/// Finalize a heal: replace the flagged files in place, and drop the
+/// job's own copy of the post once every one of them is healed. Kept
+/// when anything is left unhealed, so nothing the download produced is
+/// lost while the library still needs it.
+pub(super) fn finalize_heal(nzo: &str, out: &Path, heal_dir: &Path, sha: &str) -> FinalizeOutcome {
+    let mut fin = FinalizeOutcome::crashed();
+    fin.blocked_by.clear();
+    match crate::heal::apply_heal(heal_dir, out, sha) {
+        Ok(a) => {
+            info!(
+                target: "heal",
+                "{nzo}: healed {} file(s) in {}{}",
+                a.replaced.len(),
+                heal_dir.display(),
+                if a.unhealed.is_empty() {
+                    String::new()
+                } else {
+                    format!(" - no verified copy of {:?}", a.unhealed)
+                }
+            );
+            if a.unhealed.is_empty() && out != heal_dir && !heal_dir.starts_with(out) {
+                let _ = std::fs::remove_dir_all(out);
+            } else {
+                fin.moved = Some(out.to_path_buf());
+                if !a.unhealed.is_empty() {
+                    fin.blocked_by = format!(
+                        "the repair found no verified copy of {} file(s); the download is kept at {}",
+                        a.unhealed.len(),
+                        out.display()
+                    );
+                }
+            }
+        }
+        Err(e) => {
+            warn!(target: "heal", "{nzo}: could not heal {}: {e}", heal_dir.display());
+            fin.moved = Some(out.to_path_buf());
+            fin.blocked_by = format!("the repair could not replace the damaged files ({e})");
+        }
+    }
+    fin
 }
 
 #[cfg(test)]

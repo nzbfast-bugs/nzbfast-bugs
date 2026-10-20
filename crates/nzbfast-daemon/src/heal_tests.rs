@@ -704,3 +704,125 @@ fn a_heal_whose_recorded_post_is_gone_re_fetches_the_release_by_search() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// #366. A TV-filed season folder: heal the damaged episode and run the
+/// heal job's finalize as `job.rs` does, TV sorting on. Filing used to
+/// refuse to land on the damaged episode's (taken) name, leaving the
+/// good copy in a private folder and the library damaged. The healed
+/// copy carries the POST's file name, not the library's, so it is found
+/// by content.
+#[test]
+fn a_heal_of_a_filed_episode_replaces_it_in_the_season_folder() {
+    let dir = tdir("filed-episode");
+    let d = test_daemon(&dir);
+    d.identity_lookup.store(false, Ordering::Relaxed);
+    let season = crate::naming::out_dir(&d).join("Show").join("Season 01");
+    std::fs::create_dir_all(&season).expect("season");
+    let sha1 = record_post(&d, &dir, "nzo-ep1", EP1);
+    let sha2 = record_post(&d, &dir, "nzo-ep2", EP2);
+    settle(
+        &season,
+        EP1,
+        &sha1,
+        &[("Show - S01E01.mkv", body(20_000, 1))],
+        false,
+    );
+    settle(
+        &season,
+        EP2,
+        &sha2,
+        &[("Show - S01E02.mkv", body(20_000, 2))],
+        false,
+    );
+    damage(&season, "Show - S01E01.mkv");
+
+    let out = crate::heal::heal_start(&d, &season.to_string_lossy(), "").expect("heal");
+    assert_eq!(out["started"].as_array().map(Vec::len), Some(1), "{out}");
+    let (nzo, out_dir, replaces) = {
+        let q = d.queue.lock_ok();
+        q.iter()
+            .map(|j| j.lock_ok())
+            .find(|g| g.origin.starts_with("heal:"))
+            .map(|g| (g.nzo_id.clone(), g.out_dir.clone(), g.replaces.clone()))
+            .expect("heal row")
+    };
+    std::fs::create_dir_all(&out_dir).unwrap();
+    std::fs::write(out_dir.join(format!("{EP1}.mkv")), body(20_000, 1)).unwrap();
+    let _ = crate::job_finalize::finalize_payload(
+        d.clone(),
+        nzo,
+        out_dir.clone(),
+        replaces,
+        None,
+        dir.join("job.nzb"),
+        String::new(),
+        EP1.into(),
+        0,
+        Vec::new(),
+        String::new(),
+        true,
+    );
+    assert_eq!(
+        std::fs::read(season.join("Show - S01E01.mkv")).expect("episode"),
+        body(20_000, 1),
+        "the damaged episode was not replaced"
+    );
+    assert_eq!(
+        std::fs::read(season.join("Show - S01E02.mkv")).expect("episode 2"),
+        body(20_000, 2),
+        "the other episode was touched"
+    );
+    assert!(crate::heal::plan(&season).expect("plan").is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// #366, the cost half: a heal that FINISHED and left the folder still
+/// damaged for that post is not queued again on the next sweep. The
+/// guard used to read the queue only, so every sweep re-downloaded the
+/// whole post.
+#[test]
+fn a_heal_that_finished_without_fixing_the_folder_is_not_requeued() {
+    let dir = tdir("no-requeue");
+    let d = test_daemon(&dir);
+    let lib = dir.join("library");
+    std::fs::create_dir_all(&lib).expect("library");
+    let sha = record_post(&d, &dir, "nzo-ep1", EP1);
+    settle(
+        &lib,
+        EP1,
+        &sha,
+        &[("Show - S01E01.mkv", body(20_000, 1))],
+        false,
+    );
+    damage(&lib, "Show - S01E01.mkv");
+    crate::heal::heal_start(&d, &lib.to_string_lossy(), "").expect("first");
+    // The repair runs to completion and is filed to history; the folder
+    // is still damaged.
+    let row = {
+        let mut q = d.queue.lock_ok();
+        let at = q
+            .iter()
+            .position(|j| j.lock_ok().origin.starts_with("heal:"))
+            .expect("heal row");
+        q.remove(at).expect("row")
+    };
+    {
+        let mut g = row.lock_ok();
+        g.state = JobState::Completed;
+        g.finished_unix = Some(crate::job::unix_now());
+    }
+    d.history.lock_ok().push(row);
+
+    let again = crate::heal::heal_start(&d, &lib.to_string_lossy(), "").expect("second");
+    assert_eq!(
+        again["started"].as_array().map(Vec::len),
+        Some(0),
+        "{again}"
+    );
+    assert_eq!(
+        again["refused"].as_array().map(Vec::len),
+        Some(1),
+        "{again}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
