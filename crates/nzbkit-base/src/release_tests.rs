@@ -614,6 +614,14 @@ fn multi_episode_markers() {
 }
 
 #[test]
+fn prefixed_multi_episode_range_keeps_its_second_episode() {
+    let r = p("Show.Name.S01E01-S01E02.720p.HDTV-GRP");
+    assert_eq!((r.kind, r.season, r.episode, r.episode2), (Kind::Tv, Some(1), Some(1), Some(2)));
+    // A different season is not a range of this one.
+    assert_eq!(p("Show.Name.S01E01-S02E02.720p.HDTV-GRP").episode2, None);
+}
+
+#[test]
 fn title_that_is_a_year() {
     let m = p("2012.2009.1080p.BluRay.x264-METiS");
     assert_eq!(m.title, "2012");
