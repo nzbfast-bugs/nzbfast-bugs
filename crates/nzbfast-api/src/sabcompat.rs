@@ -1804,6 +1804,12 @@ fn jr_status(d: &Arc<Daemon>) -> Value {
     }
 }
 
+/// Our priority on NZBGet's wire scale (-100..100, Force = 900), the
+/// inverse of `nzbget_priority` for every rung it produces.
+fn nzbget_wire_priority(p: i32) -> i32 {
+    if p >= 2 { 900 } else { p * 50 }
+}
+
 fn jr_listgroups(d: &Arc<Daemon>) -> Value {
     {
         // The early start's banked bytes, read BEFORE the queue lock -
@@ -1914,8 +1920,8 @@ fn jr_listgroups(d: &Arc<Daemon>) -> Value {
                         }),
                     ),
                     ("Category".to_string(), json!(g.category)),
-                    ("Priority".to_string(), json!(g.priority * 50)),
-                    ("MaxPriority".to_string(), json!(g.priority * 50)),
+                    ("Priority".to_string(), json!(nzbget_wire_priority(g.priority))),
+                    ("MaxPriority".to_string(), json!(nzbget_wire_priority(g.priority))),
                     ("MinPostTime".to_string(), json!(0)),
                     ("MaxPostTime".to_string(), json!(0)),
                     (
@@ -2983,6 +2989,9 @@ mod tail_truth_tests;
 
 #[cfg(test)]
 mod unforce_tests;
+
+#[cfg(test)]
+mod listgroups_priority_tests;
 
 #[cfg(test)]
 mod delete_durability_tests;
