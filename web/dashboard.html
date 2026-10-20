@@ -4587,7 +4587,9 @@ let I18N={};                          // active catalogue ({} = English)
 // t(key, englishDefault, params) - {name} tokens are substituted.
 function t(k,en,p){
   let s=I18N[k]??en;
-  if(p) for(const [a,b] of Object.entries(p)) s=s.split('{'+a+'}').join(b);
+  // One pass, so a substituted value (a release name with "{why}" in it)
+  // is never rescanned for placeholders.
+  if(p) s=String(s).replace(/\{([^{}]+)\}/g,(m,a)=>Object.prototype.hasOwnProperty.call(p,a)?String(p[a]):m);
   return s;
 }
 // Plural selection via CLDR categories (Intl.PluralRules). English yields
