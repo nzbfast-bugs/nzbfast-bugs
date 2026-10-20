@@ -673,3 +673,57 @@ async fn mover_lane_bench() {
     let _ = std::fs::remove_dir_all(&root_one);
     let _ = std::fs::remove_dir_all(&root_two);
 }
+
+/// #331: a history delete that lands between the mover's eligibility
+/// snapshot and its `moving` fence (row removed, then tombstoned - the
+/// delete's own order) must stop the move, and the fence must not leak.
+#[tokio::test]
+async fn delete_between_snapshot_and_fence_stops_the_move() {
+    let s = scratch("prefence");
+    let d = test_daemon(&s);
+    let nas = s.join("nas");
+    *d.move_completed.write_ok() = Some(nas.clone());
+    let job = pending_job(&d, "PreFence.Release", "");
+    let id = job.lock_ok().nzo_id.clone();
+    let src = job.lock_ok().out_dir.clone();
+
+    struct HookGuard;
+    impl Drop for HookGuard {
+        fn drop(&mut self) {
+            *TEST_PRE_FENCE_HOOK.lock_ok() = None;
+        }
+    }
+    let _hg = HookGuard;
+    {
+        let d = d.clone();
+        let job = job.clone();
+        *TEST_PRE_FENCE_HOOK.lock_ok() = Some((
+            id.clone(),
+            Box::new(move || {
+                // The delete: fence check passes (nothing in it yet),
+                // row removed under the history lock, then tombstone.
+                assert!(!d.moving.lock_ok().contains(&job.lock_ok().nzo_id));
+                d.history.lock_ok().retain(|j| !Arc::ptr_eq(j, &job));
+                job.lock_ok().tombstone = true;
+            }),
+        ));
+    }
+
+    let requeue = tokio::task::spawn_blocking({
+        let d = d.clone();
+        let job = job.clone();
+        move || d.mover_process(&job)
+    })
+    .await
+    .unwrap();
+
+    assert!(!requeue);
+    assert!(
+        src.join("payload.bin").exists(),
+        "deleted job was moved after tombstone"
+    );
+    assert!(!nas.join("PreFence.Release").exists());
+    assert_eq!(job.lock_ok().out_dir, src);
+    assert!(!job.lock_ok().move_pending);
+    assert!(!d.moving.lock_ok().contains(&id), "fence leaked");
+}
