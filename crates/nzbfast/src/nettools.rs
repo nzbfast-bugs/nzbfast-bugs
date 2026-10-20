@@ -1163,11 +1163,28 @@ fn daemon_base(host: &str, port: u16) -> Result<String> {
     if rest.parse::<std::net::Ipv6Addr>().is_ok() {
         return Ok(format!("{scheme}://[{rest}]:{port}"));
     }
+    // What follows the host is nothing or a numeric `:port`. Anything
+    // else is refused here, the way the bare arm refuses it, rather than
+    // having `:{port}` appended to it.
+    let digits = |p: &str| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit());
     let has_port = if let Some(inner) = rest.strip_prefix('[') {
-        inner.split_once("]:").is_some()
+        let Some(end) = inner.find(']') else {
+            anyhow::bail!("--host {h}: unclosed '[' in an IPv6 literal");
+        };
+        match &inner[end + 1..] {
+            "" => false,
+            after if after.strip_prefix(':').is_some_and(digits) => true,
+            _ => anyhow::bail!("--host {h}: what follows the ']' is not a :port"),
+        }
     } else {
-        rest.rsplit_once(':')
-            .is_some_and(|(_, p)| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+        match rest.rsplit_once(':') {
+            None => false,
+            Some((hh, p)) if !hh.is_empty() && !hh.contains(':') && digits(p) => true,
+            Some(_) => anyhow::bail!(
+                "--host {h}: what follows the host is not a :port - name the port \
+                 as digits, or leave it off and use --port"
+            ),
+        }
     };
     Ok(if has_port {
         format!("{scheme}://{rest}")
@@ -1974,6 +1991,28 @@ mod stream_submit {
             daemon_base("https://[2001:db8::5]", 6789).is_ok(),
             "and that spelling round-trips through daemon_base"
         );
+    }
+
+    /// A full base whose port is empty or not a number is refused, the
+    /// same as the bare `host:port` arm refuses it - never handed on as
+    /// `http://nas.local::6789`, which no URL parser accepts and which
+    /// surfaces as "no daemon at ..." against a daemon that is running.
+    #[test]
+    fn a_full_base_with_a_malformed_port_is_refused() {
+        for bad in [
+            "http://nas.local:",
+            "https://nas.local:",
+            "http://nas.local:http",
+            "http://127.0.0.1:",
+            "https://[::1]:",
+            "https://[::1]:x",
+        ] {
+            assert!(
+                daemon_base(bad, 6789).is_err(),
+                "{bad:?} must be refused, got {:?}",
+                daemon_base(bad, 6789)
+            );
+        }
     }
 
     /// The guard comes back with the path because the file lives inside
