@@ -459,6 +459,20 @@ impl Daemon {
             let rows = self.queue_rows();
             return self.queue_publish_locked(&rows);
         }
+        // Issue #345: `enqueue` pushes the row and drops the queue lock
+        // BEFORE this takes the IO lock, so a delete can retain the row
+        // out and publish its absence in between. That publish has no
+        // tombstone to write - the id was never published - so appending
+        // the row here would resurrect the deleted job at the next start.
+        // Checked under the IO lock: a removal after this point is
+        // published by its own save, which waits for this lock and then
+        // sees the id in `published` and tombstones it. A pointer scan,
+        // not a serialization, so the add stays cheap.
+        let present = self.queue.lock_ok().iter().any(|j| Arc::ptr_eq(j, job));
+        if !present {
+            let rows = self.queue_rows();
+            return self.queue_publish_locked(&rows);
+        }
         let (id, line) = {
             let g = job.lock_ok();
             (g.nzo_id.clone(), job_json(&g).to_string())
@@ -1779,5 +1793,63 @@ mod queue_store_tests {
         assert_eq!(ids(&stored_queue(&d)), ["a", "b", "c"]);
         assert_eq!(stored_queue(&d)[0]["retries"], json!(99));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod issue_345_tests {
+    use super::*;
+    use crate::testutil::test_daemon;
+
+    /// enqueue pushes the row under the queue lock, drops it, and only
+    /// later takes the IO lock in `save_queue_row`. A delete (queue
+    /// retain + save_queue) landing in that gap is overwritten by the
+    /// stale row append, and the deleted job comes back after restart.
+    #[test]
+    fn a_job_deleted_before_its_add_row_is_published_stays_deleted_after_restart() {
+        let dir = std::env::temp_dir().join(format!("nzbfast-race-del-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = test_daemon(&dir);
+        let mk = |id: &str| {
+            let v = json!({
+                "nzo_id": id, "name": format!("{id}.Release"),
+                "nzb_path": d.spool.join(format!("{id}.nzb")).to_string_lossy(),
+                "out_dir": format!("/tmp/out/{id}"), "state": "Queued",
+            });
+            Arc::new(Mutex::new(job_from_json(&v).unwrap()))
+        };
+        d.queue.lock_ok().push_back(mk("keep"));
+        assert!(d.save_queue());
+        // enqueue: q.push_back(job), queue lock released (daemon_enqueue.rs:785)
+        let added = mk("added");
+        d.queue.lock_ok().push_back(added.clone());
+        // concurrent delete: retain + its save_queue
+        d.queue.lock_ok().retain(|j| j.lock_ok().nzo_id != "added");
+        assert!(d.save_queue());
+        // enqueue resumes: save_queue_row (daemon_enqueue.rs:818)
+        assert!(d.save_queue_row(&added));
+        let live: Vec<String> = d
+            .queue
+            .lock_ok()
+            .iter()
+            .map(|j| j.lock_ok().nzo_id.clone())
+            .collect();
+        assert_eq!(live, ["keep"]);
+
+        let d2 = test_daemon(&dir);
+        d2.load_queue();
+        let back: Vec<String> = d2
+            .queue
+            .lock_ok()
+            .iter()
+            .map(|j| j.lock_ok().nzo_id.clone())
+            .collect();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            back,
+            ["keep"],
+            "the deleted job was resurrected by the stale add row"
+        );
     }
 }
