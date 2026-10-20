@@ -1125,7 +1125,12 @@ function t(k,en,p){
 // (Latin 'other', Czech 0/5+, fractions) falls back to the .many bucket.
 const _pr=new Intl.PluralRules(LOCALE);
 function tn(base,n,enOne,enMany){
-  const cat=_pr.select(n);
+  let cat=_pr.select(n);
+  // CLDR 'one' also covers 21/101 (ru/uk/hr/sr/sl) and 0 (fr/pt): a
+  // count-less '.one' ('.two') string is only true for n===1 (2), so drop
+  // to .many.
+  const exact={one:1,two:2}[cat];
+  if(exact!=null && n!==exact && !(I18N[base+'.'+cat]??'').includes('{n}')) cat='many';
   const suf=I18N[base+'.'+cat]!=null?cat:'many';
   return t(base+'.'+suf, cat==='one'?enOne:enMany, {n});
 }

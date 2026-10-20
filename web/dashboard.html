@@ -4600,7 +4600,15 @@ function t(k,en,p){
 // vs many, so the call sites keep their (base,n,one,many) signature.
 const _pr=new Intl.PluralRules(LOCALE);
 function tn(base,n,enOne,enMany,extra){
-  const cat=_pr.select(n);                        // one | few | many | other
+  let cat=_pr.select(n);                          // one | few | many | other
+  // CLDR 'one' is not "exactly 1" everywhere: ru/uk/hr/sr put 21, 31, 101
+  // there, sl puts 101, fr/pt put 0. A '.one' string written without {n}
+  // ("remove the selected entry") is only true when n is literally 1, so
+  // any other count drops to the general plural bucket, which always
+  // carries {n}. A '.one' that does carry {n} stays - it is the
+  // grammatical form for 21. Same for sl's dual '.two' (also 102, 202…).
+  const exact={one:1,two:2}[cat];
+  if(exact!=null && n!==exact && !(I18N[base+'.'+cat]??'').includes('{n}')) cat='many';
   const suf=I18N[base+'.'+cat]!=null?cat:'many';  // unmatched category → .many
   return t(base+'.'+suf, cat==='one'?enOne:enMany, {n, ...(extra||{})});
 }
