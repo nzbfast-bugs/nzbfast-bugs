@@ -24,7 +24,9 @@ use tracing::{info, warn};
 use super::episode::legacy_tv_path;
 use super::sample::is_sample_named;
 use super::videoext::video_ext;
-use super::{EpisodeTitles, SUBTITLE_EXTS, VIDEO_EXTS, ext_of, nzbname, tv_path};
+use super::{
+    EpisodeTitles, SUBTITLE_EXTS, VIDEO_EXTS, ext_of, is_real_dir, is_real_file, nzbname, tv_path,
+};
 
 /// File a completed TV job: move everything in `out_dir` into
 /// `dest_parent/[Show]/Season NN/`, renaming video files to
@@ -88,11 +90,20 @@ pub fn tv_organize(
             Some(n) => n.to_string_lossy().into_owned(),
             None => continue,
         };
+        // A symlink is never filed (#357): moving it into the shared
+        // season folder under the canonical episode name put a link to
+        // anything the daemon can read into the user's library and
+        // claimed the slot as ours. It stays in the private folder, so a
+        // job whose only video is a link files nothing and stays unfiled.
+        if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
+            info!(target: "smart", "not filing symlink {}", path.display());
+            continue;
+        }
         let mut new_name = orig_name.clone();
         // True only when this entry became the canonical "Show - S01E02"
         // episode name; everything else keeps the name it arrived with.
         let mut is_canonical_video = false;
-        if path.is_file() {
+        if is_real_file(&path) {
             let ext = path
                 .extension()
                 .map(|e| e.to_string_lossy().to_ascii_lowercase())
@@ -215,7 +226,7 @@ pub fn tv_organize(
         // rather than replacing it, so a directory entry has nothing to
         // lose, and a placeholder FILE would break the rename outright.
         let mut placeholder = false;
-        if !path.is_dir() {
+        if !is_real_dir(&path) {
             match std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -329,7 +340,7 @@ pub fn tv_rename(dir: &Path, stem: &str, suffix: &str, titles: &EpisodeTitles) -
     let mut plan: Vec<(PathBuf, String, String, String)> = Vec::new();
     for entry in rd.flatten() {
         let path = entry.path();
-        if !path.is_file() || is_sample_named(&path) {
+        if !is_real_file(&path) || is_sample_named(&path) {
             continue;
         }
         // The extension the renamed file must carry. An extensionless
@@ -675,7 +686,7 @@ pub fn nameless_video(dir: &Path) -> Option<PathBuf> {
         // feature kept its hash through both identify and synthesised
         // naming (review sweep 6, N1). The DELETE sweep stays on
         // `is_sample_clip`; nothing here removes a file.
-        .filter(|p| p.is_file() && !is_sample_named(p) && video_ext(p).is_some())
+        .filter(|p| is_real_file(p) && !is_sample_named(p) && video_ext(p).is_some())
         .collect();
     // More than one and we cannot tell which is the feature; renaming
     // either would be a guess, and CD1/CD2 sets collide.
@@ -708,7 +719,7 @@ pub fn rename_nameless_video(out_dir: &Path, base: &str) -> bool {
         Ok(rd) => rd
             .flatten()
             .map(|e| e.path())
-            .filter(|p| p.is_file())
+            .filter(|p| is_real_file(p))
             .collect(),
         Err(_) => return false,
     };
@@ -841,7 +852,7 @@ pub fn rename_movie(parent: &Path, out_dir: &Path, base: &str) -> Option<PathBuf
         .ok()?
         .flatten()
         .map(|e| e.path())
-        .filter(|p| p.is_file())
+        .filter(|p| is_real_file(p))
         .collect();
     // `video_ext`, not VIDEO_EXTS: an extensionless payload is a video
     // since #43, and selecting on the NAME alone meant the ordinary movie
