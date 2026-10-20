@@ -2945,3 +2945,19 @@ fn a_month_is_evidence_where_the_year_it_replaced_was() {
     assert!(!looks_like_release_name("Slam.TruePDF-September.2016.pdf"));
     assert!(!looks_like_release_name("Slam.TruePDF-September.2016"));
 }
+
+/// A title word that is also spelled like release furniture ("Web",
+/// "H", "DL", "TS") must not end the title when the movie year still
+/// follows it.
+#[test]
+fn a_title_word_spelled_like_a_tag_does_not_cut_the_title() {
+    let c = p("Charlotte's.Web.2006.1080p.BluRay.x264-GRP");
+    assert_eq!((c.title.as_str(), c.year), ("Charlotte's Web", Some(2006)));
+    let m = p("M.A.S.H.1970.1080p.BluRay.x264-GRP");
+    assert_eq!((m.title.as_str(), m.year), ("M A S H", Some(1970)));
+    // The furniture readings still hold where they really are furniture.
+    let h = p("Movie.2010.1080p.BluRay.H.264-GRP");
+    assert_eq!((h.title.as_str(), h.year), ("Movie", Some(2010)));
+    let w = p("Movie.2010.1080p.WEB.H.264-GRP");
+    assert_eq!((w.title.as_str(), w.year), ("Movie", Some(2010)));
+}
