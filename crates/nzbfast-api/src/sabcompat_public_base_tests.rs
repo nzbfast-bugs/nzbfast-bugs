@@ -90,3 +90,19 @@ fn an_empty_forwarded_host_falls_through() {
         "https://127.0.0.1:6789"
     );
 }
+
+/// A URI scheme is case-insensitive (RFC 3986 section 3.1), so a proxy
+/// that forwards `X-Forwarded-Proto: HTTPS` is reporting a TLS client
+/// exactly as one sending `https` is. The base it yields decides the
+/// `Secure` attribute on the dashboard session cookie.
+#[test]
+fn a_forwarded_scheme_is_case_insensitive() {
+    assert_eq!(
+        public_base_from(s("nzb.example.com"), None, s("HTTPS"), "http", 6789),
+        "https://nzb.example.com"
+    );
+    assert_eq!(
+        public_base_from(s("nzb.example.com"), None, s("Https"), "http", 6789),
+        "https://nzb.example.com"
+    );
+}

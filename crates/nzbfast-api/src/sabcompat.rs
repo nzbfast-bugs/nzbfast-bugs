@@ -300,7 +300,8 @@ fn public_base_from(
         .filter(|h| !h.is_empty())
         .unwrap_or_else(|| format!("127.0.0.1:{port}"));
     let scheme = xf_proto
-        .map(first)
+        // A scheme is case-insensitive (RFC 3986 3.1): `HTTPS` is https.
+        .map(|v| first(v).to_ascii_lowercase())
         .filter(|s| s == "http" || s == "https")
         .unwrap_or_else(|| own_scheme.to_string());
     format!("{scheme}://{host}")
