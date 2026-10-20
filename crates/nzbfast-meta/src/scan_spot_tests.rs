@@ -435,3 +435,65 @@ async fn the_budget_still_bounds_a_fanned_out_pass() {
     assert_eq!(sum.fetched, 5);
     assert_eq!(rig.still_pending().len(), 7);
 }
+
+/// BUG HUNT: a server that answers the spot HEAD with 221 and then
+/// trickles one byte per second never trips the 120 s idle bound, and
+/// the resolver fetch has no overall deadline - so the pass (and with
+/// it the whole indexer lap) is held for as long as the peer dribbles.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bughunt_trickled_spot_head_holds_the_pass_forever() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let mut rig = Rig::build("trickle", 1, &[], 2, Chaos::default()).await;
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (s, _) = l.accept().await.unwrap();
+            tokio::spawn(async move {
+                let (r, mut w) = s.into_split();
+                let mut r = BufReader::new(r);
+                w.write_all(b"200 trickle\r\n").await.unwrap();
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    if r.read_line(&mut line).await.unwrap_or(0) == 0 {
+                        return;
+                    }
+                    let up = line.to_ascii_uppercase();
+                    if up.starts_with("HEAD") || up.starts_with("BODY") {
+                        let id = line.split_whitespace().nth(1).unwrap_or("").to_string();
+                        w.write_all(format!("221 0 {id}\r\n").as_bytes()).await.unwrap();
+                        loop {
+                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                            if w.write_all(b"X").await.is_err() {
+                                return;
+                            }
+                        }
+                    } else if up.starts_with("CAPABILITIES") {
+                        w.write_all(b"101 caps\r\nVERSION 2\r\nREADER\r\n.\r\n").await.unwrap();
+                    } else if up.starts_with("QUIT") {
+                        let _ = w.write_all(b"205 bye\r\n").await;
+                        return;
+                    } else {
+                        w.write_all(b"500 what\r\n").await.unwrap();
+                    }
+                }
+            });
+        }
+    });
+    let mut sc = rig.srv.server_config();
+    sc.host = addr.ip().to_string();
+    sc.port = addr.port();
+    sc.connections = 2;
+    std::fs::write(&rig.cfg, serde_json::json!({ "servers": [sc] }).to_string()).unwrap();
+    // The per-fetch deadline is 3 s under test; give it ample margin.
+    let r = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        super::spot_resolve_pass(&rig.cfg, &mut rig.ix, 10, || false),
+    )
+    .await;
+    let sum = r
+        .expect("spot resolve pass still wedged on a 1 B/s HEAD (issue #347)")
+        .unwrap();
+    assert_eq!((sum.fetched, sum.failed), (0, 1), "the trickled spot is a failed fetch");
+}
