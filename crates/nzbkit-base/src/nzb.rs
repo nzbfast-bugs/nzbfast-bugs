@@ -1680,7 +1680,8 @@ fn classify_runs<'a>(runs: &[&'a str], subject: &'a str) -> SubjectClass<'a> {
 /// scars.
 fn unquoted_candidate(s: &str) -> Option<&str> {
     // The yEnc marker ends the name; everything after it is decoration.
-    let mut head = match s.find(" yEnc") {
+    // Case-insensitive: posters write `yenc` and `YENC` too.
+    let mut head = match s.to_ascii_lowercase().find(" yenc") {
         Some(i) => &s[..i],
         None => s,
     };
@@ -1688,8 +1689,13 @@ fn unquoted_candidate(s: &str) -> Option<&str> {
     // whitespace/dash separators around them.
     fn strip_one_counter(t: &str) -> &str {
         let t = t.trim_end_matches(|c: char| c.is_whitespace() || c == '-');
-        if let Some(i) = t.rfind('(')
-            && t.ends_with(')')
+        let close = match t.as_bytes().last() {
+            Some(b')') => Some('('),
+            Some(b']') => Some('['),
+            _ => None,
+        };
+        if let Some(open) = close
+            && let Some(i) = t.rfind(open)
         {
             let inner = &t[i + 1..t.len() - 1];
             let mut parts = inner.split('/');
