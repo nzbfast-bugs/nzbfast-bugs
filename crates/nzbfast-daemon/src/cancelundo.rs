@@ -181,6 +181,15 @@ pub struct UndoOutcome {
 /// that makes the restart purge correct.
 static UNDO_SEQ: AtomicU64 = AtomicU64::new(1);
 
+/// The next retained-copy number, shared by both undo stores (they share
+/// one directory). Makes every held copy's file name unique, so two live
+/// tokens for one nzo_id never name the same file (GH #330).
+static HELD_SEQ: AtomicU64 = AtomicU64::new(1);
+
+pub(crate) fn next_held_seq() -> u64 {
+    HELD_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 impl Daemon {
     /// `<spool>/undo`, created on demand.
     ///
@@ -234,10 +243,18 @@ impl Daemon {
         // season legitimately share a display name, and a collision
         // here would hand the second row's undo the first row's NZB -
         // the same pairing bug `hold_or_drop_spool`'s FIFO fixed.
-        let dest = dir.join(format!("{}.nzb", g.nzo_id));
-        // A leftover under this name is from an earlier cancel of the
-        // same id whose window has since been swept; `hard_link` fails
-        // on an existing destination, so it goes first.
+        //
+        // And by a per-copy sequence as well as the id (GH #330): one id
+        // can be cancelled, come back, and be cancelled again inside the
+        // window, which leaves two live tokens for it. Keyed by the id
+        // alone they shared one path, so the older token's expiry
+        // unlinked the newer token's copy. Each copy's path is its own,
+        // the row records it, and the sweep and the restore only ever
+        // touch the path their own row names.
+        let dest = dir.join(format!("{}.{}.nzb", g.nzo_id, next_held_seq()));
+        // Unique per process, so a leftover can only be from a previous
+        // run that the startup purge missed; `hard_link` fails on an
+        // existing destination, so it goes first.
         let _ = std::fs::remove_file(&dest);
         if let Err(link_err) = std::fs::hard_link(&g.nzb_path, &dest) {
             // No links on this filesystem (exFAT, some SMB mounts), or
