@@ -816,6 +816,24 @@ async fn feed_items_are_dated_by_upload_not_by_index_time() {
             !nodate.contains("1970"),
             "unknown-date release dated at the epoch: {nodate}"
         );
+
+        // maxage must agree with the pubDate it is answered with: an age
+        // ceiling that admits the advertised date admits the row.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let days = (now - INDEXED) / 86_400 + 30;
+        let (code, body) = http_get(port, &format!("/api?t=search&maxage={days}"));
+        assert_eq!(code, 200, "{body}");
+        assert!(
+            body.contains("Nodate.Show.S02E02"),
+            "maxage={days} dropped a row whose own pubDate is inside it:\n{body}"
+        );
+        assert!(
+            !body.contains("Old.Show.S01E01"),
+            "maxage={days} kept a 2017 row:\n{body}"
+        );
     })
     .await
     .unwrap();

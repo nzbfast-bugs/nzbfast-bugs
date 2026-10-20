@@ -434,7 +434,12 @@ impl Index {
         }
         if q.newer_than > 0 {
             let p = bind(&mut params, Box::new(q.newer_than));
-            wheres.push(format!("{{}}first_posted >= {p}"));
+            // A row whose post date never parsed (first_posted 0) is
+            // dated by first_seen everywhere it is shown, so the age
+            // ceiling reads the same date.
+            wheres.push(format!(
+                "({{}}first_posted >= {p} OR ({{}}first_posted <= 0 AND {{}}first_seen >= {p}))"
+            ));
         }
         // M28: junk ceiling (curation) - None = no filter.
         if let Some(max) = q.max_junk {
