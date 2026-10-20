@@ -193,6 +193,11 @@ pub enum FileStatus {
     PresentUnverified,
     /// A source entry the tail consumed - informational, never damage.
     SourceGone,
+    /// Not under its recorded name, but found intact under `to` (a
+    /// rename after the manifest was written). Not damage (#370).
+    Renamed {
+        to: String,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -211,7 +216,10 @@ impl VerifyReport {
         self.files.iter().all(|(_, s)| {
             matches!(
                 s,
-                FileStatus::Ok | FileStatus::PresentUnverified | FileStatus::SourceGone
+                FileStatus::Ok
+                    | FileStatus::PresentUnverified
+                    | FileStatus::SourceGone
+                    | FileStatus::Renamed { .. }
             )
         })
     }
@@ -620,10 +628,22 @@ impl Manifest {
         let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for e in &self.files {
             seen.insert(e.name.as_str());
+        }
+        // Files on disk the manifest never named: the only candidates a
+        // renamed entry can have moved to (#370).
+        let mut untracked: Vec<(String, u64, PathBuf)> = walk_files(dir)?
+            .into_iter()
+            .filter(|(n, _, _)| !seen.contains(n.as_str()))
+            .collect();
+        let mut head = HeadCache::default();
+        for e in &self.files {
             let path = dir.join(&e.name);
             let status = match std::fs::metadata(&path) {
                 Err(_) if e.role == Role::Source => FileStatus::SourceGone,
-                Err(_) => FileStatus::Missing,
+                Err(_) => match rematch_renamed(e, &mut untracked, &mut head)? {
+                    Some(st) => st,
+                    None => FileStatus::Missing,
+                },
                 Ok(m) if m.len() != e.len => FileStatus::SizeMismatch { found: m.len() },
                 // Nothing recorded to check it against: no whole-file
                 // digest AND no grid. A grid alone is enough - that is
@@ -636,13 +656,62 @@ impl Manifest {
             };
             report.files.push((e.name.clone(), status));
         }
-        for (n, _, _) in walk_files(dir)? {
-            if !seen.contains(n.as_str()) {
-                report.extras.push(n);
-            }
-        }
+        report.extras = untracked.into_iter().map(|(n, _, _)| n).collect();
         Ok(report)
     }
+}
+
+/// An entry whose name is gone from disk: was it RENAMED (by the user,
+/// or by anything after the manifest was written) rather than lost?
+/// Candidates are untracked files of the same length - narrowed by the
+/// first-16k MD5 when the entry recorded one, the same identity
+/// `write_reconciled` uses. A candidate that passes the entry's FULL
+/// check is the file, intact, under a new name (`Renamed`). A head-hash
+/// match that fails the check is this file, damaged, so the check's
+/// verdict is reported rather than `Missing`; a length-only candidate
+/// that fails proves nothing and is left alone. An entry with nothing to
+/// check (presence) can only be matched by its head hash.
+fn rematch_renamed(
+    e: &Entry,
+    untracked: &mut Vec<(String, u64, PathBuf)>,
+    head: &mut HeadCache,
+) -> std::io::Result<Option<FileStatus>> {
+    let checkable = e.md5.is_some() || !e.crc32s.is_empty();
+    let mut damaged_head: Option<(usize, FileStatus)> = None;
+    for i in 0..untracked.len() {
+        let (_, l, p) = &untracked[i];
+        if *l != e.len {
+            continue;
+        }
+        let head_ok = match e.md5_16k.as_deref() {
+            Some(want) => {
+                if head.get(p, e.len) != Some(want) {
+                    continue;
+                }
+                true
+            }
+            None => false,
+        };
+        if !checkable {
+            if head_ok {
+                let (n, _, _) = untracked.swap_remove(i);
+                return Ok(Some(FileStatus::Renamed { to: n }));
+            }
+            continue;
+        }
+        match check_entry(e, e.bs, p)? {
+            FileStatus::Ok => {
+                let (n, _, _) = untracked.swap_remove(i);
+                return Ok(Some(FileStatus::Renamed { to: n }));
+            }
+            st if head_ok && damaged_head.is_none() => damaged_head = Some((i, st)),
+            _ => {}
+        }
+    }
+    Ok(damaged_head.map(|(i, st)| {
+        untracked.swap_remove(i);
+        st
+    }))
 }
 
 /// Stream one file against its entry: per-block CRC32 (last block
@@ -1104,6 +1173,9 @@ pub fn verify_cli(dir: &Path) -> std::io::Result<bool> {
             FileStatus::Missing => warn!(target: "par2", "✘ {name} - file missing"),
             FileStatus::SizeMismatch { found } => {
                 warn!(target: "par2", "✘ {name} - size changed (now {found} bytes)");
+            }
+            FileStatus::Renamed { to } => {
+                info!(target: "par2", "✔ {name} - intact, renamed to {to}");
             }
         }
     }
