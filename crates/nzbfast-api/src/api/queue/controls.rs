@@ -249,13 +249,21 @@ pub fn reposition_for_priority(
         g.priority
     };
     let job = q.remove(from)?;
-    let to = q
-        .iter()
-        .position(|j| {
-            let o = j.lock_ok();
-            o.state == JobState::Queued && !o.tombstone && o.priority < prio
-        })
-        .unwrap_or(q.len());
+    let queued = |j: &Arc<Mutex<Job>>, keep: &dyn Fn(i32) -> bool| {
+        let o = j.lock_ok();
+        o.state == JobState::Queued && !o.tombstone && keep(o.priority)
+    };
+    // Behind the LAST queued row of this priority or higher, not before
+    // the first lower one: a lower row (a held duplicate, a dragged Low
+    // job) can sit between two members of the group, and landing in
+    // front of it would overtake the group's later, older members.
+    let to = match q.iter().rposition(|j| queued(j, &|p| p >= prio)) {
+        Some(last) => last + 1,
+        None => q
+            .iter()
+            .position(|j| queued(j, &|p| p < prio))
+            .unwrap_or(q.len()),
+    };
     q.insert(to, job);
     Some(to)
 }
