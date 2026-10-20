@@ -62,7 +62,10 @@ pub fn rename_obfuscated_audio(dir: &Path) -> usize {
     let mut plan: Vec<(PathBuf, String)> = Vec::new();
     for entry in rd.flatten() {
         let path = entry.path();
-        if !path.is_file() {
+        // `file_type` does not follow links (#358): a symlinked "track"
+        // would have its TARGET's tags read and written into a name in
+        // the job - anything the daemon can read, renamed after itself.
+        if !entry.file_type().is_ok_and(|t| t.is_file()) {
             continue;
         }
         if let Some(name) = track_name(&path) {
@@ -241,6 +244,24 @@ mod tests {
             .collect();
         v.sort();
         v
+    }
+
+    /// #358: a symlinked track is not probed or renamed - its target's
+    /// tags must not name anything in the job.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_track_is_never_probed_or_renamed() {
+        let root = &scratch("symlink");
+        let job = root.join("job");
+        std::fs::create_dir_all(&job).unwrap();
+        track(root, "outside.flac", 7, "Outside Secret Title");
+        let link = "aa45c7a08991e64c86c87cb4a9347db02712db3d54.flac";
+        std::os::unix::fs::symlink(root.join("outside.flac"), job.join(link)).unwrap();
+        let renamed = rename_obfuscated_audio(&job);
+        let names = listing(&job);
+        let _ = std::fs::remove_dir_all(root);
+        assert_eq!(renamed, 0);
+        assert_eq!(names, vec![link.to_string()]);
     }
 
     /// The occupancy guard is a CLAIM, so an entry that arrives while
