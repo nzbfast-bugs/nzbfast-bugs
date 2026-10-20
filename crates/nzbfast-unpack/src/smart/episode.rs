@@ -462,6 +462,9 @@ pub fn delete_filed_episode(dir: &Path, stem: &str, tail: &FiledTail) -> FiledDe
             match remove_user_file(&path, recoverable) {
                 Ok(how) => {
                     out.removed += 1;
+                    if let Some(n) = path.file_name().and_then(|n| n.to_str()) {
+                        out.removed_names.push(n.to_string());
+                    }
                     any_removed = true;
                     all_trashed &= how == Removed::Trashed;
                 }
@@ -500,6 +503,10 @@ pub struct FiledDelete {
     /// as recoverable, because the half the user goes looking for may be
     /// the half that is not there.
     pub removed_as: Removed,
+    /// The on-disk names of the files actually removed, so the caller can
+    /// drop them from the folder's settle manifest (else verify reports a
+    /// deliberately deleted episode `Missing` and heal offers it back).
+    pub removed_names: Vec<String>,
 }
 
 impl Default for FiledDelete {
@@ -509,6 +516,7 @@ impl Default for FiledDelete {
             kept: None,
             // Nothing was removed, so there is nothing to promise back.
             removed_as: Removed::Gone,
+            removed_names: Vec::new(),
         }
     }
 }
